@@ -1,0 +1,41 @@
+# Rust
+/target/
+Cargo.lock
+*.pdb
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Node modules (if using any JS tooling)
+node_modules/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Test coverage
+coverage/
+*.profraw
+*.profdata
