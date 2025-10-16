@@ -1,7 +1,11 @@
 use deno_core::{v8, JsRuntime};
 
 /// Рендерит HTML через V8 runtime
-pub fn render_html(url: &str, products_json: Option<&str>, js_runtime: &mut JsRuntime) -> Result<String, String> {
+pub fn render_html(
+    url: &str,
+    products_json: Option<&str>,
+    js_runtime: &mut JsRuntime,
+) -> Result<String, String> {
     let products_data = products_json.unwrap_or("[]");
 
     let render_code = format!(
@@ -15,8 +19,7 @@ pub fn render_html(url: &str, products_json: Option<&str>, js_runtime: &mut JsRu
             }}
         }})()
         "#,
-        url,
-        products_data
+        url, products_data
     );
 
     // Выполняем JS код

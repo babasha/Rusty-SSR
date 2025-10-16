@@ -51,11 +51,13 @@ impl ColdCache {
     }
 
     /// Вставляет HTML в кэш с LRU eviction
-    pub fn insert(&self, url_hash: u64, html: Arc<str>) {
+    pub fn insert(&self, url_hash: u64, html: Arc<str>) -> Option<u64> {
         // Evict least recently used entry if cache is full
-        if self.cache.len() >= self.max_entries {
-            self.evict_lru();
-        }
+        let evicted = if self.cache.len() >= self.max_entries {
+            self.evict_lru()
+        } else {
+            None
+        };
 
         let new_access = self.access_counter.fetch_add(1, Ordering::Relaxed);
         self.cache.insert(
@@ -65,10 +67,12 @@ impl ColdCache {
                 last_access: AtomicU64::new(new_access),
             },
         );
+
+        evicted
     }
 
     /// Вытесняет наименее недавно использованную запись (LRU)
-    fn evict_lru(&self) {
+    fn evict_lru(&self) -> Option<u64> {
         // Находим запись с минимальным last_access
         let mut oldest_key: Option<u64> = None;
         let mut oldest_access = u64::MAX;
@@ -85,6 +89,8 @@ impl ColdCache {
         if let Some(key) = oldest_key {
             self.cache.remove(&key);
         }
+
+        oldest_key
     }
 
     /// Возвращает количество записей в кэше
@@ -97,6 +103,10 @@ impl ColdCache {
     #[allow(dead_code)]
     pub fn clear(&self) {
         self.cache.clear();
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_entries
     }
 }
 

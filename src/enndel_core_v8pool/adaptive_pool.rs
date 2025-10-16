@@ -1,6 +1,8 @@
+use core_affinity::CoreId;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use tokio::sync::oneshot;
 use std::thread;
+use tokio::sync::oneshot;
 
 use super::{renderer, runtime};
 
@@ -9,6 +11,10 @@ use super::{renderer, runtime};
 pub struct AdaptivePoolConfig {
     /// Количество потоков (обычно = CPU cores)
     pub num_threads: usize,
+    /// Размер очереди входящих задач
+    pub queue_capacity: usize,
+    /// Пинning потоков к конкретным CPU
+    pub pin_threads: bool,
 }
 
 impl Default for AdaptivePoolConfig {
@@ -16,6 +22,8 @@ impl Default for AdaptivePoolConfig {
         let num_cpus = num_cpus::get();
         Self {
             num_threads: num_cpus,
+            queue_capacity: 512,
+            pin_threads: false,
         }
     }
 }
@@ -33,26 +41,32 @@ pub struct AdaptiveV8Pool {
     request_tx: mpsc::SyncSender<RenderRequest>,
     request_rx: Arc<Mutex<mpsc::Receiver<RenderRequest>>>,
     worker_count: Arc<Mutex<usize>>,
+    core_affinity: Option<Arc<Vec<CoreId>>>,
+    next_core: Arc<AtomicUsize>,
 }
 
 impl AdaptiveV8Pool {
     /// Создаёт новый V8 thread pool
     pub fn new(config: AdaptivePoolConfig) -> Self {
-        tracing::info!(
-            "🔧 Creating V8 pool with {} threads",
-            config.num_threads
-        );
+        tracing::info!("🔧 Creating V8 pool with {} threads", config.num_threads);
 
-        // Bounded channel с размером очереди 100
-        let (request_tx, request_rx) = mpsc::sync_channel(100);
+        // Bounded channel с настраиваемым размером очереди
+        let (request_tx, request_rx) = mpsc::sync_channel(config.queue_capacity);
         let request_rx = Arc::new(Mutex::new(request_rx));
         let worker_count = Arc::new(Mutex::new(0));
+        let core_affinity = if config.pin_threads {
+            core_affinity::get_core_ids().map(Arc::new)
+        } else {
+            None
+        };
 
         let pool = Self {
             config: config.clone(),
             request_tx,
             request_rx: Arc::clone(&request_rx),
             worker_count: Arc::clone(&worker_count),
+            core_affinity,
+            next_core: Arc::new(AtomicUsize::new(0)),
         };
 
         // Создаём фиксированное количество воркеров
@@ -69,6 +83,8 @@ impl AdaptiveV8Pool {
     fn spawn_worker(&self, id: usize) {
         let request_rx = Arc::clone(&self.request_rx);
         let worker_count = Arc::clone(&self.worker_count);
+        let core_affinity = self.core_affinity.clone();
+        let next_core = Arc::clone(&self.next_core);
 
         // Увеличиваем счётчик воркеров
         {
@@ -79,9 +95,22 @@ impl AdaptiveV8Pool {
         thread::spawn(move || {
             tracing::debug!("🟢 Worker {} started", id);
 
+            if let Some(cores) = core_affinity {
+                let idx = next_core.fetch_add(1, Ordering::Relaxed) % cores.len();
+                if let Some(core_id) = cores.get(idx) {
+                    if core_affinity::set_for_current(*core_id) {
+                        tracing::debug!("📌 Worker {} pinned to core {:?}", id, core_id.id);
+                    }
+                }
+            }
+
             // Инициализируем V8 runtime для этого потока
             if let Err(e) = runtime::init_runtime() {
-                tracing::error!("❌ Failed to initialize V8 runtime for worker {}: {}", id, e);
+                tracing::error!(
+                    "❌ Failed to initialize V8 runtime for worker {}: {}",
+                    id,
+                    e
+                );
                 let mut count = worker_count.lock().unwrap();
                 *count -= 1;
                 return;
@@ -105,6 +134,8 @@ impl AdaptiveV8Pool {
                 };
 
                 if let Some(req) = request {
+                    prefetch_request(&req);
+
                     // Обрабатываем запрос
                     let result = runtime::with_runtime(|js_runtime| {
                         renderer::render_html(&req.url, req.products_json.as_deref(), js_runtime)
@@ -137,7 +168,11 @@ impl AdaptiveV8Pool {
     }
 
     /// Рендерит HTML через пул с данными продуктов
-    pub async fn render_with_data(&self, url: String, products_json: String) -> Result<String, String> {
+    pub async fn render_with_data(
+        &self,
+        url: String,
+        products_json: String,
+    ) -> Result<String, String> {
         // Создаём канал для ответа
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -146,7 +181,7 @@ impl AdaptiveV8Pool {
             .send(RenderRequest {
                 url,
                 products_json: Some(products_json),
-                response_tx
+                response_tx,
             })
             .map_err(|_| "Failed to send render request".to_string())?;
 
@@ -162,9 +197,44 @@ impl AdaptiveV8Pool {
     }
 }
 
+#[cfg(test)]
+impl AdaptiveV8Pool {
+    pub(crate) fn new_stub() -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel(0);
+        Self {
+            config: AdaptivePoolConfig {
+                num_threads: 0,
+                queue_capacity: 0,
+                pin_threads: false,
+            },
+            request_tx,
+            request_rx: Arc::new(Mutex::new(request_rx)),
+            worker_count: Arc::new(Mutex::new(0)),
+            core_affinity: None,
+            next_core: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 impl Drop for AdaptiveV8Pool {
     fn drop(&mut self) {
         tracing::info!("🛑 Shutting down adaptive V8 pool");
         // Каналы автоматически закроются, воркеры завершатся
+    }
+}
+
+fn prefetch_request(request: &RenderRequest) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if let Some(json) = &request.products_json {
+            unsafe {
+                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(json.as_ptr() as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let _ = request.products_json.as_ref().map(|s| s.as_bytes().len());
     }
 }

@@ -86,10 +86,7 @@ pub async fn brotli_static(request: Request, next: Next) -> Result<Response, Sta
 /// Middleware для динамического Brotli сжатия HTML ответов от SSR
 ///
 /// Проверяет Accept-Encoding: br и сжимает HTML на лету
-pub async fn brotli_compress_html(
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
+pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Response, StatusCode> {
     // Проверяем поддержку Brotli
     let accepts_brotli = request
         .headers()

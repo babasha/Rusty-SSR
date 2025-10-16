@@ -12,14 +12,14 @@ pub async fn ssr_handler(
     State(state): State<Arc<AppState>>,
     uri: Uri,
 ) -> Result<Html<String>, StatusCode> {
-    let url = uri.path().to_string();
+    let url = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
 
     // Получаем ТОЛЬКО критичные данные (текст для SEO)
-    let (critical_products, version) = state
-        .product_cache
-        .get_critical_all()
-        .await
-        .map_err(|e| {
+    let (critical_products, version) =
+        state.product_cache.get_critical_all().await.map_err(|e| {
             tracing::error!("Failed to get critical products: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -31,8 +31,7 @@ pub async fn ssr_handler(
 
     // Сериализуем только критичные данные (извлекаем из Arc)
     let products_data: Vec<_> = critical_products.iter().map(|p| &**p).collect();
-    let products_json = serde_json::to_string(&products_data)
-        .unwrap_or_else(|_| "[]".to_string());
+    let products_json = serde_json::to_string(&products_data).unwrap_or_else(|_| "[]".to_string());
 
     tracing::debug!(
         "🎨 Rendering SSR for {} with {} products (version: 0x{:X})",

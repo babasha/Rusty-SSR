@@ -48,7 +48,10 @@ mod tests {
         let hash1 = hash_url("/page1");
         let hash2 = hash_url("/page2");
 
-        assert_ne!(hash1, hash2, "Different URLs should produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "Different URLs should produce different hashes"
+        );
     }
 
     #[test]
