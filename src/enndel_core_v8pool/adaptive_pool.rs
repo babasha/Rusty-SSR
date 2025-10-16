@@ -23,6 +23,7 @@ impl Default for AdaptivePoolConfig {
 /// Запрос на рендеринг
 struct RenderRequest {
     url: String,
+    products_json: Option<String>,
     response_tx: oneshot::Sender<Result<String, String>>,
 }
 
@@ -106,7 +107,7 @@ impl AdaptiveV8Pool {
                 if let Some(req) = request {
                     // Обрабатываем запрос
                     let result = runtime::with_runtime(|js_runtime| {
-                        renderer::render_html(&req.url, js_runtime)
+                        renderer::render_html(&req.url, req.products_json.as_deref(), js_runtime)
                     });
 
                     // Отправляем результат
@@ -132,12 +133,21 @@ impl AdaptiveV8Pool {
 
     /// Рендерит HTML через пул
     pub async fn render(&self, url: String) -> Result<String, String> {
+        self.render_with_data(url, "[]".to_string()).await
+    }
+
+    /// Рендерит HTML через пул с данными продуктов
+    pub async fn render_with_data(&self, url: String, products_json: String) -> Result<String, String> {
         // Создаём канал для ответа
         let (response_tx, response_rx) = oneshot::channel();
 
         // Отправляем запрос в пул (synchronous send)
         self.request_tx
-            .send(RenderRequest { url, response_tx })
+            .send(RenderRequest {
+                url,
+                products_json: Some(products_json),
+                response_tx
+            })
             .map_err(|_| "Failed to send render request".to_string())?;
 
         // Ждём ответа (async recv)

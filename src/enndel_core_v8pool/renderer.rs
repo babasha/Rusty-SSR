@@ -1,19 +1,23 @@
 use deno_core::{v8, JsRuntime};
 
 /// Рендерит HTML через V8 runtime
-pub fn render_html(url: &str, js_runtime: &mut JsRuntime) -> Result<String, String> {
+pub fn render_html(url: &str, products_json: Option<&str>, js_runtime: &mut JsRuntime) -> Result<String, String> {
+    let products_data = products_json.unwrap_or("[]");
+
     let render_code = format!(
         r#"
         (async function() {{
             try {{
                 return await globalThis.renderPage("{}");
+                return await globalThis.renderPage("{}", {});
             }} catch (error) {{
                 console.error("Render error:", error);
                 return `<html><body><h1>SSR Error</h1><pre>${{error.stack}}</pre></body></html>`;
             }}
         }})()
         "#,
-        url
+        url,
+        products_data
     );
 
     // Выполняем JS код

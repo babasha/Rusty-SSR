@@ -1148,7 +1148,7 @@ var SSRBundle = function(exports) {
     });
     return statuses.join(", ");
   });
-  const API_URL = typeof window !== "undefined" ? "/api" : "https://enddel.com";
+  const API_URL = typeof window !== "undefined" ? "/api" : "https://enddel.com/api";
   async function loadProducts() {
     if (products.value.length > 0) return;
     loading.value = true;
@@ -2478,8 +2478,6 @@ var SSRBundle = function(exports) {
   function App() {
     return _$1(Shop, {});
   }
-  const SSR_PRODUCT_ENDPOINT = "https://enddel.com/products";
-  const SSR_USER_AGENT = "Mozilla/5.0 (compatible; EnddelSSR/1.0)";
   function normalizeProducts(rawProducts) {
     return rawProducts.map((p2) => ({
       ...p2,
@@ -2512,17 +2510,8 @@ var SSRBundle = function(exports) {
     productsLoading.value = true;
     productsError.value = null;
     try {
-      const response = await fetch(SSR_PRODUCT_ENDPOINT, {
-        headers: {
-          "User-Agent": SSR_USER_AGENT,
-          "Accept": "application/json"
-        }
-      });
-      if (!response.ok) {
-        throw new Error(`SSR fetch failed with status ${response.status}`);
-      }
-      const data = await response.json();
-      const loadedProducts = Array.isArray(data == null ? void 0 : data.products) ? data.products : Array.isArray(data) ? data : [];
+      const productsData = context.productsData || [];
+      const loadedProducts = Array.isArray(productsData == null ? void 0 : productsData.products) ? productsData.products : Array.isArray(productsData) ? productsData : [];
       const normalized = normalizeProducts(loadedProducts);
       products.value = normalized;
       initialData.products = normalized;
@@ -2560,13 +2549,14 @@ var SSRBundle = function(exports) {
 globalThis.renderToString = SSRBundle.renderToString;
 
 // Глобальная функция для рендеринга (вызывается из Rust)
-globalThis.renderPage = async function(url) {
+globalThis.renderPage = async function(url, productsData) {
     try {
         // Вызываем рендеринг
         const context = {
             url: url,
             headers: {},
-            userAgent: 'Rust-V8-SSR/1.0'
+            userAgent: 'Rust-V8-SSR/1.0',
+            productsData: productsData || []
         };
 
         const result = await SSRBundle.renderToString(context);
@@ -2584,7 +2574,7 @@ globalThis.renderPage = async function(url) {
 <body>
     <div id="app" data-preact-root>${result.html}</div>
     <script>window.__INITIAL_DATA__ = ${JSON.stringify(result.initialData)}</script>
-    <script type="module" src="/assets/index-DDdVKlrV.js"></script>
+    <script type="module" src="/assets/index-sTKbqqrz.js"></script>
 </body>
 </html>`;
 

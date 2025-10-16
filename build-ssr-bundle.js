@@ -31,13 +31,14 @@ ${ssrCode}
 globalThis.renderToString = SSRBundle.renderToString;
 
 // Глобальная функция для рендеринга (вызывается из Rust)
-globalThis.renderPage = async function(url) {
+globalThis.renderPage = async function(url, productsData) {
     try {
         // Вызываем рендеринг
         const context = {
             url: url,
             headers: {},
-            userAgent: 'Rust-V8-SSR/1.0'
+            userAgent: 'Rust-V8-SSR/1.0',
+            productsData: productsData || []
         };
 
         const result = await SSRBundle.renderToString(context);
@@ -55,7 +56,7 @@ globalThis.renderPage = async function(url) {
 <body>
     <div id="app" data-preact-root>\${result.html}</div>
     <script>window.__INITIAL_DATA__ = \${JSON.stringify(result.initialData)}</script>
-    <script type="module" src="/assets/index-DDdVKlrV.js"></script>
+    <script type="module" src="/assets/index-sTKbqqrz.js"></script>
 </body>
 </html>\`;
 
