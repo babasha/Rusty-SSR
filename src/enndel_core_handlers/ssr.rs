@@ -14,36 +14,47 @@ pub async fn ssr_handler(
 ) -> Result<Html<String>, StatusCode> {
     let url = uri.path().to_string();
 
-    // Проверяем кэш (hot + cold with auto-promotion)
-    if let Some(cached_html) = state.ssr_cache.try_get(&url) {
+    // Получаем ТОЛЬКО критичные данные (текст для SEO)
+    let (critical_products, version) = state
+        .product_cache
+        .get_critical_all()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get critical products: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Проверяем кэш с версионированием
+    if let Some(cached_html) = state.ssr_cache.try_get_versioned(&url, version) {
         return Ok(Html(cached_html.to_string()));
     }
 
-    // Загружаем продукты с API для SSR
-    let products_json = fetch_products().await.unwrap_or_else(|e| {
-        tracing::warn!("Failed to fetch products for SSR: {}", e);
-        "[]".to_string()
-    });
+    // Сериализуем только критичные данные (извлекаем из Arc)
+    let products_data: Vec<_> = critical_products.iter().map(|p| &**p).collect();
+    let products_json = serde_json::to_string(&products_data)
+        .unwrap_or_else(|_| "[]".to_string());
 
-    // Cache miss - рендерим через V8 с данными продуктов
+    tracing::debug!(
+        "🎨 Rendering SSR for {} with {} products (version: 0x{:X})",
+        url,
+        critical_products.len(),
+        version
+    );
+
+    // Cache miss - рендерим через V8 с критичными данными
     let html = state
         .v8_pool
         .render_with_data(url.clone(), products_json)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!("SSR render error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    // Сохраняем в кэш (hot + cold)
-    state.ssr_cache.insert(&url, Arc::from(html.as_str()));
+    // Сохраняем в кэш с версией
+    state
+        .ssr_cache
+        .insert_versioned(&url, Arc::from(html.as_str()), version);
 
     Ok(Html(html))
-}
-
-/// Загружает продукты с API
-async fn fetch_products() -> Result<String, Box<dyn std::error::Error>> {
-    let response = reqwest::get("https://enddel.com/api/products")
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
-
-    Ok(serde_json::to_string(&response)?)
 }

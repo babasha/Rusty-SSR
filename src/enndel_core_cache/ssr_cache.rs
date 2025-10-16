@@ -116,6 +116,13 @@ impl SSRCache {
         None
     }
 
+    /// Пробует получить HTML из кэша с версионированием
+    pub fn try_get_versioned(&self, url: &str, version: u64) -> Option<Arc<str>> {
+        // Добавляем версию в ключ кэша
+        let versioned_url = format!("{}@v{:x}", url, version);
+        self.try_get(&versioned_url)
+    }
+
     /// Вставляет HTML в кэш
     pub fn insert(&self, url: &str, html: Arc<str>) {
         let url_hash = hash_url(url);
@@ -127,6 +134,13 @@ impl SSRCache {
         let hot = self.hot_cache.get_or(|| RefCell::new(HotCache::new()));
         let mut hot = hot.borrow_mut();
         hot.insert(url_hash, html);
+    }
+
+    /// Вставляет HTML в кэш с версией
+    pub fn insert_versioned(&self, url: &str, html: Arc<str>, version: u64) {
+        // Добавляем версию в ключ кэша
+        let versioned_url = format!("{}@v{:x}", url, version);
+        self.insert(&versioned_url, html);
     }
 
     /// Очищает cold cache (hot cache очистится автоматически)

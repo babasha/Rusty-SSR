@@ -10,9 +10,9 @@ use std::sync::Arc;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use enndel_core_cache::SSRCache;
+use enndel_core_cache::{ProductCache, SSRCache};
 use enndel_core_config::ServerConfig;
-use enndel_core_handlers::{api_proxy_handler, ssr_handler};
+use enndel_core_handlers::{api_proxy_handler, lazy_images_handler, ssr_handler};
 use enndel_core_state::AppState;
 use enndel_core_v8pool::{AdaptivePoolConfig, AdaptiveV8Pool};
 
@@ -37,11 +37,22 @@ async fn main() {
     // Создаём SSR cache (300 страниц в cold cache)
     let ssr_cache = SSRCache::new(300);
 
+    // Создаём Product cache
+    let product_cache = ProductCache::new();
+
+    // Предзагрузка критичных данных
+    product_cache.preload().await;
+
     // Создаём состояние приложения
-    let app_state = Arc::new(AppState::new(v8_pool, ssr_cache));
+    let app_state = Arc::new(AppState::new(v8_pool, ssr_cache, product_cache));
 
     // Создаём роутер
     let app = Router::new()
+        // API для ленивой загрузки изображений
+        .route(
+            "/api/products/lazy/:id",
+            get(lazy_images_handler),
+        )
         // API прокси (должен быть первым, чтобы не перехватывался SSR)
         .route("/api/*path", get(api_proxy_handler))
         // Статические файлы с Brotli middleware
