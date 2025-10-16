@@ -45,7 +45,7 @@ async fn main() {
         // API прокси (должен быть первым, чтобы не перехватывался SSR)
         .route("/api/*path", get(api_proxy_handler))
         // Статические файлы с Brotli middleware
-        .nest_service("/assets", ServeDir::new("../dist/client/assets"))
+        .nest_service("/assets", ServeDir::new("../EnndelClient/dist/client/assets"))
         .layer(middleware::from_fn(enndel_core_brotli::brotli_static))
         // SSR рендеринг (последний, catch-all для всех остальных путей)
         .fallback(ssr_handler)

@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Читаем SSR entry (IIFE формат из Vite)
-const ssrCode = fs.readFileSync(path.join(__dirname, '../dist/server/server-entry.js'), 'utf-8');
+const ssrCode = fs.readFileSync(path.join(__dirname, '../EnndelClient/dist/server/server-entry.js'), 'utf-8');
 
 // Создаём обёртку которая экспортирует renderToString глобально
 const wrappedBundle = `
@@ -55,7 +55,7 @@ globalThis.renderPage = async function(url) {
 <body>
     <div id="app" data-preact-root>\${result.html}</div>
     <script>window.__INITIAL_DATA__ = \${JSON.stringify(result.initialData)}</script>
-    <script type="module" src="/assets/index-DdBg9HLV.js"></script>
+    <script type="module" src="/assets/index-DDdVKlrV.js"></script>
 </body>
 </html>\`;
 
