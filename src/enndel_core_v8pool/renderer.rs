@@ -8,7 +8,6 @@ pub fn render_html(url: &str, products_json: Option<&str>, js_runtime: &mut JsRu
         r#"
         (async function() {{
             try {{
-                return await globalThis.renderPage("{}");
                 return await globalThis.renderPage("{}", {});
             }} catch (error) {{
                 console.error("Render error:", error);
