@@ -96,7 +96,7 @@ pub struct ProductCache {
 
 impl ProductCache {
     pub const DEFAULT_LAZY_CACHE_CAPACITY: usize = 256;
-    pub const DEFAULT_API_BASE: &'static str = "https://enddel.com/api";
+    pub const DEFAULT_API_BASE: &'static str = "http://localhost:8080";
 
     pub fn new() -> Self {
         Self::with_options(Self::DEFAULT_API_BASE, Self::DEFAULT_LAZY_CACHE_CAPACITY)

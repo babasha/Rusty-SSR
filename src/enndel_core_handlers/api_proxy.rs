@@ -4,10 +4,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// API прокси handler - перенаправляет /api/* на https://enddel.com/api/*
+/// API прокси handler - перенаправляет /api/* на http://localhost:8080/*
 pub async fn api_proxy_handler(Path(path): Path<String>) -> Result<Response, StatusCode> {
     let client = reqwest::Client::new();
-    let url = format!("https://enddel.com/api/{}", path);
+    let url = format!("http://localhost:8080/{}", path);
 
     tracing::debug!("Proxying API request: {}", url);
 
