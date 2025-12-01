@@ -8,6 +8,11 @@ Cargo.lock
 *.dylib
 *.dll
 
+# SSR bundles (generated, project-specific)
+ssr-bundle.js
+ssr-bundle-embedded.js
+ssr-bundle*.js
+
 # IDE
 .vscode/
 .idea/
