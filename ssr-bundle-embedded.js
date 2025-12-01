@@ -1157,10 +1157,25 @@ var SSRBundle = function(exports) {
       const res = await fetch(`${API_URL}/products`);
       const data = await res.json();
       const loadedProducts = data.products || data || [];
-      products.value = loadedProducts.map((p2) => ({
-        ...p2,
-        titles: p2.titles || p2.name
-      }));
+      products.value = loadedProducts.map((p2) => {
+        var _a, _b, _c, _d, _e, _f;
+        return {
+          ...p2,
+          name: {
+            ru: p2.name_ru || ((_a = p2.name) == null ? void 0 : _a.ru) || "",
+            en: p2.name_en || ((_b = p2.name) == null ? void 0 : _b.en) || "",
+            geo: p2.name_pt || p2.name_geo || ((_c = p2.name) == null ? void 0 : _c.geo) || ""
+          },
+          titles: {
+            ru: p2.name_ru || ((_d = p2.name) == null ? void 0 : _d.ru) || "",
+            en: p2.name_en || ((_e = p2.name) == null ? void 0 : _e.en) || "",
+            geo: p2.name_pt || p2.name_geo || ((_f = p2.name) == null ? void 0 : _f.geo) || ""
+          },
+          step: p2.step || 1,
+          // Дефолтный step = 1 если null
+          discounts: p2.discounts || []
+        };
+      });
     } catch (error) {
       console.error("Failed to load products:", error);
       productsError.value = "Ошибка загрузки товаров";
@@ -1169,27 +1184,6 @@ var SSRBundle = function(exports) {
       loading.value = false;
       productsLoading.value = false;
     }
-  }
-  function addToCart(product, quantity = 1) {
-    const existing = cartItems.value.find((item) => item.id === product.id);
-    if (existing) {
-      cartItems.value = cartItems.value.map(
-        (item) => item.id === product.id ? { ...item, quantity: item.quantity + quantity } : item
-      );
-    } else {
-      const titles = product.titles || product.name;
-      cartItems.value = [...cartItems.value, {
-        id: product.id,
-        title: titles[currentLanguage.value],
-        titles,
-        price: product.price,
-        quantity,
-        unit: product.unit,
-        step: product.step,
-        discounts: product.discounts
-      }];
-    }
-    saveCartToStorage();
   }
   function addItemToCart(item) {
     const existing = cartItems.value.find((cartItem) => cartItem.id === item.id);
@@ -1488,8 +1482,7 @@ var SSRBundle = function(exports) {
   const ImageComponent = ({
     imageUrl,
     alt,
-    children,
-    onClick
+    children
   }) => {
     const [isLoaded, setIsLoaded] = d$2(false);
     const [hasError, setHasError] = d$2(false);
@@ -1500,7 +1493,7 @@ var SSRBundle = function(exports) {
       setHasError(true);
       setIsLoaded(false);
     }, []);
-    return /* @__PURE__ */ u("div", { className: "product-cart__image-wrapper", onClick, children: [
+    return /* @__PURE__ */ u("div", { className: "product-cart__image-wrapper", children: [
       imageUrl && !hasError && /* @__PURE__ */ u(
         "img",
         {
@@ -1516,7 +1509,7 @@ var SSRBundle = function(exports) {
         "Изображение",
         /* @__PURE__ */ u("br", {}),
         "не загружено"
-      ] }) : /* @__PURE__ */ u("div", { style: { color: "#666" }, children: "Загрузка..." }) }),
+      ] }) : /* @__PURE__ */ u("div", { className: "product-cart__skeleton" }) }),
       children
     ] });
   };
@@ -1659,9 +1652,16 @@ var SSRBundle = function(exports) {
     vendorClosed = false,
     children
   }) => {
+    const [ripples, setRipples] = d$2([]);
     const isUnavailable = outOfStock || vendorClosed;
     const getButtonClass = () => {
       let classes = ["toggle-button"];
+      if (price !== void 0) {
+        classes.push("toggle-button--has-price");
+      }
+      if (detailView) {
+        classes.push("toggle-button--detail-view");
+      }
       if (isUnavailable) {
         if (outOfStock) {
           classes.push("toggle-button--out-of-stock");
@@ -1688,12 +1688,30 @@ var SSRBundle = function(exports) {
       }
       return isActive ? "Убрать из корзины" : "Добавить в корзину";
     };
+    const handleClick = (e2) => {
+      if (isUnavailable || isDisabled) return;
+      const button = e2.currentTarget;
+      const rect = button.getBoundingClientRect();
+      const size = Math.max(rect.width, rect.height);
+      const x2 = e2.clientX - rect.left - size / 2;
+      const y2 = e2.clientY - rect.top - size / 2;
+      const newRipple = {
+        key: Date.now(),
+        x: x2,
+        y: y2,
+        size
+      };
+      setRipples((prev) => [...prev, newRipple]);
+      setTimeout(() => {
+        setRipples((prev) => prev.filter((r2) => r2.key !== newRipple.key));
+      }, 600);
+      onClick();
+    };
     return /* @__PURE__ */ u(
       "button",
       {
         className: getButtonClass(),
-        onClick: isUnavailable ? () => {
-        } : onClick,
+        onClick: handleClick,
         disabled: isDisabled || isUnavailable,
         style: fontSize ? { fontSize } : void 0,
         "aria-label": getButtonText(),
@@ -1708,7 +1726,20 @@ var SSRBundle = function(exports) {
               detailView
             }
           ),
-          getButtonText()
+          getButtonText(),
+          ripples.map((ripple) => /* @__PURE__ */ u(
+            "span",
+            {
+              className: "toggle-button__ripple",
+              style: {
+                left: `${ripple.x}px`,
+                top: `${ripple.y}px`,
+                width: `${ripple.size}px`,
+                height: `${ripple.size}px`
+              }
+            },
+            ripple.key
+          ))
         ]
       }
     );
@@ -1815,7 +1846,7 @@ var SSRBundle = function(exports) {
       ] })
     ] });
   };
-  const calculateTotalPrice = (basePrice, quantity, unit, step, discounts) => {
+  const calculateTotalPrice$1 = (basePrice, quantity, unit, step, discounts) => {
     let price = basePrice;
     if (discounts && discounts.length > 0) {
       const quantityInSteps = unit === "g" ? quantity / step : quantity;
@@ -1856,7 +1887,7 @@ var SSRBundle = function(exports) {
       return getImageUrl(imageUrl);
     }, [product.imageUrl, productDetails == null ? void 0 : productDetails.imageUrl]);
     const totalPrice = T$1(
-      () => calculateTotalPrice(product.price, currentQuantity, product.unit, product.step, product.discounts || []),
+      () => calculateTotalPrice$1(product.price, currentQuantity, product.unit, product.step, product.discounts || []),
       [product.price, currentQuantity, product.unit, product.step, product.discounts]
     );
     const isActuallyOutOfStock = T$1(() => {
@@ -2201,6 +2232,324 @@ var SSRBundle = function(exports) {
       )
     );
   };
+  const FlexWrapper = ({
+    children,
+    justify = "flex-start",
+    align = "flex-start",
+    direction = "row",
+    gap,
+    className = "",
+    style = {},
+    // Дополнительные props для совместимости
+    radius,
+    bottom,
+    top,
+    bg
+  }) => {
+    const flexStyle = {
+      display: "flex",
+      justifyContent: justify,
+      alignItems: align,
+      flexDirection: direction,
+      gap,
+      borderRadius: radius,
+      marginBottom: bottom,
+      marginTop: top,
+      backgroundColor: bg,
+      ...style
+    };
+    let classes = "flex-wrapper";
+    if (justify === "space-between") {
+      classes += " flex-wrapper--space-between";
+    }
+    if (justify === "center" && align === "center") {
+      classes += " flex-wrapper--center";
+    }
+    if (direction === "column") {
+      classes += " flex-wrapper--column";
+    }
+    if (className) {
+      classes += ` ${className}`;
+    }
+    return /* @__PURE__ */ u("div", { className: classes, style: flexStyle, children });
+  };
+  const DiscountInfo = ({
+    discounts,
+    unit,
+    step,
+    show,
+    onToggle,
+    onClose
+  }) => {
+    const getDiscountText = (discount) => {
+      if (unit === "g") {
+        const quantity = discount.quantity * step;
+        const unit_text = quantity < 1e3 ? "г" : "кг";
+        const display_quantity = quantity < 1e3 ? quantity : (quantity / 1e3).toFixed(2);
+        return `От ${display_quantity}${unit_text} - ${discount.price}₾ за ${step}г`;
+      } else {
+        return `От ${discount.quantity} ${unit} - ${discount.price}₾ за ${unit}`;
+      }
+    };
+    return /* @__PURE__ */ u(k$2, { children: [
+      /* @__PURE__ */ u("div", { className: "discount-label", onClick: onToggle, children: "Скидки" }),
+      show && /* @__PURE__ */ u("div", { className: "discount-popup", onMouseLeave: onClose, children: discounts.map((discount) => /* @__PURE__ */ u("div", { children: getDiscountText(discount) }, discount.quantity)) })
+    ] });
+  };
+  const Title = ({ title, onClick }) => {
+    return /* @__PURE__ */ u("p", { className: "product-cart__title", onClick, children: title });
+  };
+  const useIsMobile = () => {
+    const [deviceInfo, setDeviceInfo] = d$2({
+      isMobile: false,
+      isMobileUserAgent: false
+    });
+    y$1(() => {
+      const checkDevice = () => {
+        const isMobileScreen = window.innerWidth <= 480;
+        const userAgent = navigator.userAgent.toLowerCase();
+        const isMobileUA = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent);
+        setDeviceInfo({
+          isMobile: isMobileScreen,
+          isMobileUserAgent: isMobileUA
+        });
+      };
+      checkDevice();
+      window.addEventListener("resize", checkDevice);
+      return () => {
+        window.removeEventListener("resize", checkDevice);
+      };
+    }, []);
+    return deviceInfo.isMobile;
+  };
+  const calculateTotalPrice = (basePrice, quantity, unit, step, discounts) => {
+    let price = basePrice;
+    if (discounts && discounts.length > 0) {
+      const quantityInSteps = unit === "g" ? quantity / step : quantity;
+      const applicableDiscounts = discounts.filter((discount) => quantityInSteps >= discount.quantity);
+      if (applicableDiscounts.length > 0) {
+        const maxDiscount = applicableDiscounts.reduce(
+          (prev, curr) => curr.price < prev.price ? curr : prev
+          // Берем лучшую цену
+        );
+        price = maxDiscount.price;
+      }
+    }
+    return unit === "g" ? Math.round(price * quantity / step * 100) / 100 : Math.round(price * quantity * 100) / 100;
+  };
+  const ProductCart = (props) => {
+    const productData = T$1(() => {
+      if (props.product) {
+        return {
+          id: props.product.id,
+          price: props.product.price,
+          imageUrl: props.product.image_url,
+          titles: props.product.name,
+          unit: props.product.unit,
+          step: props.product.step,
+          discounts: props.product.discounts,
+          stock_quantity: props.product.stock_quantity,
+          vendor_id: props.product.vendor_id,
+          slug: props.product.slug,
+          category_id: props.product.category_id
+        };
+      }
+      return {
+        id: props.id,
+        price: props.price,
+        imageUrl: props.imageUrl,
+        titles: props.titles,
+        unit: props.unit || "шт",
+        step: props.step || 1,
+        discounts: props.discounts || [],
+        stock_quantity: props.stock_quantity || 0,
+        vendor_id: props.vendor_id,
+        slug: props.slug,
+        category_id: props.category_id
+      };
+    }, [props]);
+    const {
+      id,
+      price,
+      imageUrl,
+      titles,
+      unit,
+      step,
+      discounts,
+      stock_quantity,
+      vendor_id,
+      slug,
+      category_id
+    } = productData;
+    const {
+      mode = "catalog",
+      onAddRecipeProduct,
+      autoOpen = false,
+      onOpenDetail,
+      t: t2 = (key, fallback) => fallback || key,
+      language,
+      isVendorOpen = true
+    } = props;
+    const isMobile = useIsMobile();
+    const [showDiscountInfo, setShowDiscountInfo] = d$2(false);
+    const [catalogQuantity, setCatalogQuantity] = d$2(step);
+    const [recipeQuantity, setRecipeQuantity] = d$2(step);
+    const cartItem = getCartItemById(id);
+    const currentLang = language || currentLanguage.value;
+    const stockQty = stock_quantity ?? 0;
+    const isOutOfStock = stockQty >= 0 && stockQty <= 0;
+    const isProductUnavailable = isOutOfStock || !isVendorOpen;
+    const isInCart = mode === "catalog" && !!cartItem;
+    const isActive = mode === "catalog" ? isInCart : false;
+    const quantity = isInCart ? cartItem.quantity : mode === "catalog" ? catalogQuantity : recipeQuantity;
+    const localizedTitle = T$1(() => getLocalizedTitle(titles, currentLang), [titles, currentLang]);
+    const totalPrice = T$1(() => calculateTotalPrice(price, quantity, unit, step, discounts), [price, quantity, unit, step, discounts]);
+    const processedImageUrl = T$1(() => getImageUrl(imageUrl), [imageUrl]);
+    const handleQuantityChange = q$1((newQuantity) => {
+      if (mode === "catalog") {
+        if (cartItem) {
+          updateCartItem({ ...cartItem, quantity: newQuantity });
+        } else {
+          setCatalogQuantity(newQuantity);
+        }
+      } else if (mode === "recipe") {
+        setRecipeQuantity(newQuantity);
+        if (onAddRecipeProduct) {
+          const title = getLocalizedTitle(titles, currentLang);
+          onAddRecipeProduct({ id, title, price, unit, step, discounts }, newQuantity);
+        }
+      }
+    }, [cartItem, mode, onAddRecipeProduct, id, titles, currentLang, price, unit, step, discounts]);
+    const handleToggleCart = q$1(() => {
+      if (isProductUnavailable) return;
+      const title = getLocalizedTitle(titles, currentLang);
+      if (mode === "catalog") {
+        if (isInCart) {
+          removeItemFromCart(id);
+        } else {
+          const cartItemData = {
+            id,
+            title,
+            titles,
+            price,
+            quantity: catalogQuantity,
+            unit,
+            step,
+            discounts
+          };
+          addItemToCart(cartItemData);
+        }
+      } else if (mode === "recipe" && onAddRecipeProduct) {
+        onAddRecipeProduct(
+          { id, title, price, unit, step, discounts },
+          recipeQuantity
+        );
+      }
+    }, [mode, isInCart, currentLang, discounts, id, price, step, titles, unit, onAddRecipeProduct, isProductUnavailable, catalogQuantity, recipeQuantity]);
+    const handleToggleDiscountInfo = () => setShowDiscountInfo(!showDiscountInfo);
+    const handleOpenDetail = q$1(() => {
+      if (onOpenDetail) {
+        const productData2 = {
+          id,
+          titles,
+          price,
+          imageUrl,
+          unit,
+          step,
+          discounts,
+          stock_quantity: stockQty,
+          slug
+        };
+        onOpenDetail(productData2);
+      }
+    }, [onOpenDetail, id, titles, price, imageUrl, unit, step, discounts, stockQty, slug]);
+    const getToggleButtonText = () => {
+      if (isActive) {
+        return t2("remove_from_cart", "Убрать из корзины");
+      }
+      return t2("add_to_cart", "Добавить в корзину");
+    };
+    return /* @__PURE__ */ u("div", { className: "product-cart fade-in", "data-testid": `product-card-${id}`, children: [
+      /* @__PURE__ */ u("div", { onClick: handleOpenDetail, style: { cursor: "pointer" }, children: [
+        /* @__PURE__ */ u(
+          ImageComponent,
+          {
+            imageUrl: processedImageUrl,
+            alt: localizedTitle,
+            children: [
+              isProductUnavailable && /* @__PURE__ */ u("div", { className: "product-cart__unavailable-overlay", children: /* @__PURE__ */ u("div", { className: `product-cart__unavailable-badge ${isOutOfStock ? "product-cart__unavailable-badge--out-of-stock" : "product-cart__unavailable-badge--vendor-closed"}`, children: isOutOfStock ? t2("product.out_of_stock", "Нет в наличии") : t2("vendor.closed", "Магазин закрыт") }) }),
+              discounts && discounts.length > 0 && /* @__PURE__ */ u(
+                DiscountInfo,
+                {
+                  discounts,
+                  unit,
+                  step,
+                  show: showDiscountInfo,
+                  onToggle: handleToggleDiscountInfo,
+                  onClose: () => setShowDiscountInfo(false)
+                }
+              )
+            ]
+          }
+        ),
+        /* @__PURE__ */ u(Title, { title: localizedTitle })
+      ] }),
+      /* @__PURE__ */ u(
+        QuantityControl$1,
+        {
+          basePrice: price,
+          quantity,
+          onQuantityChange: handleQuantityChange,
+          unit,
+          step,
+          discounts
+        }
+      ),
+      isMobile ? /* @__PURE__ */ u(
+        ToggleButton,
+        {
+          onClick: handleToggleCart,
+          isActive,
+          isDisabled: isProductUnavailable,
+          price: mode === "catalog" ? totalPrice : void 0,
+          outOfStock: isOutOfStock,
+          vendorClosed: !isVendorOpen,
+          children: getToggleButtonText()
+        }
+      ) : /* @__PURE__ */ u(FlexWrapper, { justify: "space-between", children: [
+        mode === "catalog" && /* @__PURE__ */ u(Price, { amount: totalPrice }),
+        /* @__PURE__ */ u(
+          ToggleButton,
+          {
+            onClick: handleToggleCart,
+            isActive,
+            isDisabled: isProductUnavailable,
+            outOfStock: isOutOfStock,
+            vendorClosed: !isVendorOpen,
+            children: getToggleButtonText()
+          }
+        )
+      ] })
+    ] });
+  };
+  const ProductCart$1 = M(ProductCart);
+  const getInitialTheme = () => {
+    if (typeof window === "undefined") return "light";
+    const saved = localStorage.getItem("theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  };
+  const theme = d$1(getInitialTheme());
+  if (typeof window !== "undefined") {
+    E$1(() => {
+      const currentTheme = theme.value;
+      document.documentElement.setAttribute("data-theme", currentTheme);
+      localStorage.setItem("theme", currentTheme);
+    });
+  }
+  function toggleTheme() {
+    theme.value = theme.value === "light" ? "dark" : "light";
+  }
   const isClient = typeof window !== "undefined";
   function useWindowWidth() {
     const [width, setWidth] = d$2(isClient ? window.innerWidth : 1200);
@@ -2233,14 +2582,6 @@ var SSRBundle = function(exports) {
     const currentHasOrders = isClient ? hasActiveOrders.value : false;
     const currentOrderStatus = isClient ? orderStatusText.value : "";
     const currentSearchQuery = isClient ? searchQuery.value : "";
-    const handleAddToCart = (product) => {
-      if (!isClient) return;
-      if (product.stock_quantity <= 0) {
-        alert("Товар закончился");
-        return;
-      }
-      addToCart(product);
-    };
     const handleSearch = (e2) => {
       if (!isClient) return;
       const target = e2.target;
@@ -2341,12 +2682,10 @@ var SSRBundle = function(exports) {
               "div",
               { className: "products-grid" },
               currentProducts.map(
-                (product) => _$1(ProductCard, {
+                (product) => _$1(ProductCart$1, {
                   key: product.id,
                   product,
-                  onAddToCart: handleAddToCart,
-                  onProductClick: handleProductClick,
-                  isClient
+                  onOpenDetail: () => handleProductClick(product)
                 })
               )
             ),
@@ -2422,57 +2761,13 @@ var SSRBundle = function(exports) {
       isClient && _$1(Authorization, {
         isOpen: isAuthOpen,
         onClose: () => setIsAuthOpen(false)
-      })
-    );
-  }
-  function ProductCard({ product, onAddToCart, onProductClick, isClient: isClient2 }) {
-    var _a;
-    const inCart = isClient2 ? cartItems.value && Array.isArray(cartItems.value) ? cartItems.value.some((item) => item.id === product.id) : false : false;
-    const outOfStock = product.stock_quantity <= 0;
-    const title = ((_a = product.name) == null ? void 0 : _a.ru) || product.name || "Товар";
-    const imageUrl = product.image_url ? getImageUrl(product.image_url) : null;
-    return _$1(
-      "div",
-      {
-        className: "product-card",
-        onClick: isClient2 ? () => onProductClick(product) : void 0,
-        style: { cursor: "pointer" }
-      },
-      _$1(
-        "div",
-        { className: "product-image" },
-        imageUrl ? _$1("img", {
-          src: imageUrl,
-          alt: title,
-          loading: "lazy",
-          onError: (e2) => {
-            if (e2.target.crossOrigin) {
-              console.log("Retry without crossOrigin:", imageUrl);
-              e2.target.crossOrigin = null;
-              e2.target.src = imageUrl;
-            } else {
-              console.log("Ошибка загрузки изображения, показываем placeholder:", imageUrl);
-              e2.target.style.display = "none";
-            }
-          }
-        }) : _$1("div", { className: "product-placeholder" }, "📦"),
-        !imageUrl && _$1("div", { className: "product-placeholder" }, "📦"),
-        outOfStock && _$1("div", { className: "out-of-stock-badge" }, "Нет в наличии")
-      ),
-      _$1("h3", { className: "product-name" }, title),
-      _$1("div", { className: "product-price" }, `${product.price || 0} ₽`),
-      _$1(
-        "button",
-        {
-          className: `btn ${inCart ? "btn-success" : "btn-primary"}`,
-          onClick: isClient2 ? (e2) => {
-            e2.stopPropagation();
-            onAddToCart(product);
-          } : void 0,
-          disabled: outOfStock || !isClient2
-        },
-        inCart ? "✓ В корзине" : "В корзину"
-      )
+      }),
+      // Кнопка переключения темы
+      isClient && _$1("button", {
+        className: "theme-toggle",
+        onClick: toggleTheme,
+        "aria-label": "Переключить тему"
+      }, theme.value === "light" ? "🌙" : "☀️")
     );
   }
   function App() {
