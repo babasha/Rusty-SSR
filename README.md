@@ -1,261 +1,227 @@
-# 🦀 Rust SSR Server для Enddel
+# 🦀 Rusty SSR
 
-Высокопроизводительный SSR сервер на Rust с V8 isolate pool для рендеринга Preact приложения.
+High-performance Server-Side Rendering engine for Rust with V8 isolate pool and multi-tier CPU-optimized caching.
 
-## 🚀 Особенности
+[![Crates.io](https://img.shields.io/crates/v/rusty-ssr.svg)](https://crates.io/crates/rusty-ssr)
+[![Documentation](https://docs.rs/rusty-ssr/badge.svg)](https://docs.rs/rusty-ssr)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- **V8 Isolate Pool** - параллельная обработка SSR запросов на всех CPU ядрах
-- **Preact SSR** - серверный рендеринг через встроенный V8 движок
-- **Brotli сжатие** - автоматическая раздача pre-compressed файлов (.br)
-- **API прокси** - проксирование запросов к https://enddel.com/api
-- **Zero-copy** - эффективная работа с памятью благодаря Rust
+## Features
 
-## 📊 Производительность
+- **V8 Isolate Pool** — Parallel SSR rendering on all CPU cores
+- **Multi-tier Cache** — L1/L2 CPU cache (hot) + RAM (cold) with LRU eviction
+- **Axum Integration** — Ready-to-use middleware and handlers
+- **Brotli Compression** — Static and dynamic compression
+- **Zero-copy** — Efficient memory usage with `Arc<str>`
 
-**Протестировано на MacBook Pro M1/M2 (10 cores, 16GB RAM)**
+## Performance
 
-### Основные метрики
+| Metric | Value |
+|--------|-------|
+| **Peak throughput** | 73,000+ req/s |
+| **Cache hit latency** | ~0.2ms |
+| **vs Node.js SSR** | 10-15x faster |
+| **vs Go SSR** | 3x faster |
 
-| Метрика | Значение | Статус |
-|---------|----------|--------|
-| **Peak throughput** | **73,304 req/s** | 🔥🔥🔥 |
-| **Cache hit latency** | **0.195ms** | ⚡ Sub-millisecond |
-| **Under load (1k conns)** | 18.37ms avg | ✅ Stable |
-| **Daily capacity** | **6.3 billion requests** | 🚀 Massive |
-| **Tested requests** | 1,960,000+ | ✅ Zero failures |
+## Quick Start
 
-### Benchmark Results
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rusty-ssr = "0.1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+```
+
+### Basic Usage
+
+```rust
+use rusty_ssr::prelude::*;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    // Create the SSR engine
+    let engine = SsrEngine::builder()
+        .bundle_path("ssr-bundle.js")
+        .pool_size(num_cpus::get())
+        .cache_size(300)
+        .cache_ttl_secs(300)
+        .build_engine()
+        .expect("Failed to create SSR engine");
+
+    // Render a page
+    let html = engine.render("/home").await.unwrap();
+    println!("{}", html);
+}
+```
+
+### With Axum
+
+```rust
+use axum::{extract::State, response::Html, routing::get, Router};
+use rusty_ssr::prelude::*;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    let engine = Arc::new(
+        SsrEngine::builder()
+            .bundle_path("ssr-bundle.js")
+            .build_engine()
+            .unwrap()
+    );
+
+    let app = Router::new()
+        .route("/*path", get(ssr_handler))
+        .with_state(engine);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn ssr_handler(
+    State(engine): State<Arc<SsrEngine>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Html<String> {
+    match engine.render(&format!("/{}", path)).await {
+        Ok(html) => Html(html.to_string()),
+        Err(e) => Html(format!("<h1>Error</h1><pre>{}</pre>", e)),
+    }
+}
+```
+
+## JavaScript Bundle
+
+Your SSR bundle should expose a global render function:
+
+```javascript
+// ssr-bundle.js
+globalThis.renderPage = async function(url, data) {
+    // Your SSR logic here (Preact, React, etc.)
+    return `<html>
+        <body>
+            <h1>Hello from ${url}</h1>
+        </body>
+    </html>`;
+};
+```
+
+### With Preact
+
+```javascript
+import { h } from 'preact';
+import renderToString from 'preact-render-to-string';
+import App from './App';
+
+globalThis.renderPage = async function(url, data) {
+    const html = renderToString(<App url={url} data={data} />);
+    return `<!DOCTYPE html>
+        <html>
+            <head><title>My App</title></head>
+            <body>${html}</body>
+        </html>`;
+};
+```
+
+## Configuration
+
+```rust
+let engine = SsrEngine::builder()
+    .bundle_path("ssr-bundle.js")     // Path to JS bundle
+    .pool_size(8)                      // V8 worker threads
+    .queue_capacity(512)               // Task queue size
+    .pin_threads(true)                 // Pin to CPU cores
+    .cache_size(300)                   // Max cached pages
+    .cache_ttl_secs(300)               // Cache TTL (5 min)
+    .render_function("renderPage")     // JS function name
+    .build_engine()?;
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    SsrEngine                         │
+│                                                      │
+│  ┌──────────────┐         ┌───────────────────┐    │
+│  │   SSR Cache  │ ──miss─► │     V8 Pool       │    │
+│  │              │ ◄─────── │                   │    │
+│  │  Hot (L1/L2) │  result  │  ┌─────┐ ┌─────┐ │    │
+│  │  Cold (RAM)  │          │  │ V8  │ │ V8  │ │    │
+│  │  LRU evict   │          │  └─────┘ └─────┘ │    │
+│  └──────────────┘          └───────────────────┘    │
+└─────────────────────────────────────────────────────┘
+```
+
+### Cache Tiers
+
+| Tier | Location | Latency | Size |
+|------|----------|---------|------|
+| Hot | L1/L2 CPU | ~1-3ns | 8 entries/thread |
+| Cold | RAM | ~100ns | Configurable (default 300) |
+
+## Feature Flags
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `v8-pool` | ✅ | V8 thread pool |
+| `cache` | ✅ | Multi-tier caching |
+| `axum-integration` | ✅ | Axum middleware |
+| `brotli-compression` | ❌ | Brotli middleware |
+| `full` | ❌ | All features |
+
+```toml
+# Minimal (just V8 pool)
+rusty-ssr = { version = "0.1", default-features = false, features = ["v8-pool"] }
+
+# Full
+rusty-ssr = { version = "0.1", features = ["full"] }
+```
+
+## Metrics
+
+```rust
+let metrics = engine.cache_metrics();
+println!("Hit rate: {:.1}%", metrics.hit_rate);
+println!("Lookups: {}", metrics.lookups);
+println!("Hot hits: {}", metrics.hot_hits);
+println!("Cold hits: {}", metrics.cold_hits);
+println!("Misses: {}", metrics.misses);
+println!("Cache size: {}/{}", metrics.cold_size, metrics.cold_capacity);
+```
+
+## Benchmarks
+
+Tested on MacBook Pro M1/M2 (10 cores, 16GB RAM):
 
 ```bash
-# Standard test (curl)
-./benchmark.sh
-
-# Production test (wrk)
 wrk -t12 -c1000 -d10s http://localhost:3000/
 ```
 
-**Результаты wrk (1000 connections):**
 ```
-Requests/sec:  73,304.09
+Requests/sec:  73,304
 Latency avg:   18.37ms
-Total:         734,217 requests in 10s
-Success rate:  100%
+Transfer/sec:  156.82MB
 ```
 
-### Сравнение с индустрией
+### Comparison
 
-| Framework | Throughput | Latency | vs This |
-|-----------|-----------|---------|---------|
-| **This Server (Rust)** | **73,304 req/s** | 18ms | **1x** 🏆 |
-| Next.js (Node.js) | ~5,000 req/s | 30-50ms | **0.07x** |
-| Remix (Node.js) | ~6,000 req/s | 25-40ms | **0.08x** |
-| Go SSR | ~25,000 req/s | 15-20ms | **0.34x** |
-| NGINX (static) | ~50,000 req/s | 8-10ms | **0.68x** |
+| Framework | Throughput | vs Rusty SSR |
+|-----------|-----------|--------------|
+| **Rusty SSR** | 73,000 req/s | 1x |
+| Next.js | ~5,000 req/s | 0.07x |
+| Remix | ~6,000 req/s | 0.08x |
+| Go SSR | ~25,000 req/s | 0.34x |
 
-**Result: 10-15x faster than Node.js SSR, 3x faster than Go!** 🚀
+## License
 
-### Архитектурные преимущества
+MIT License - free to use, modify and distribute.
+The only requirement is to keep the copyright notice (attribution).
 
-✅ **Multi-tier cache** (L1/L2 + RAM) → 0.195ms cache hits
-✅ **V8 Thread Pool** (10 workers) → Full CPU utilization
-✅ **Zero-copy Arc<str>** → No memory duplication
-✅ **Lock-free DashMap** → Concurrent cache access
-✅ **LRU eviction** → Atomic counter-based
-✅ **Cache-line aligned** → L1 cache efficiency
+See [LICENSE](LICENSE) for details.
 
-**Подробности:** См. [BENCHMARK.md](./BENCHMARK.md)
+## Contributing
 
-## 🛠️ Установка и запуск
-
-### Требования
-
-- Rust 1.70+ (установить через [rustup](https://rustup.rs/))
-- Node.js 18+ (для сборки SSR бандла)
-
-### Сборка SSR бандла
-
-Сначала нужно собрать SSR бандл из Preact приложения:
-
-```bash
-# Из корня проекта
-cd ..
-npm run build:ssr
-
-# Из rust-server директории
-node build-ssr-bundle.js
-```
-
-Это создаст файл `ssr-bundle-embedded.js` который будет загружен в V8.
-
-### Запуск сервера
-
-```bash
-cargo run --release
-```
-
-Сервер запустится на http://localhost:3000
-
-## 📁 Структура проекта
-
-```
-rust-server/
-├── src/
-│   ├── main.rs                      # Entry point, Axum router
-│   ├── enndel_core_v8pool/          # V8 Thread Pool
-│   │   ├── mod.rs                   # Public API
-│   │   ├── adaptive_pool.rs         # Fixed pool (10 workers)
-│   │   ├── runtime.rs               # Thread-local V8 runtimes
-│   │   ├── renderer.rs              # SSR rendering
-│   │   └── bundle.rs                # Bundle loader (OnceLock)
-│   ├── enndel_core_cache/           # Multi-tier Cache
-│   │   ├── mod.rs                   # Public API
-│   │   ├── ssr_cache.rs             # Cache coordinator
-│   │   ├── hot_cache.rs             # L1/L2 (8 entries, 512B)
-│   │   ├── cold_cache.rs            # RAM (DashMap + LRU)
-│   │   └── cache_utils.rs           # Hash utilities
-│   ├── enndel_core_handlers/        # HTTP Handlers
-│   │   ├── mod.rs
-│   │   ├── ssr.rs                   # SSR with cache
-│   │   └── api_proxy.rs             # API proxy
-│   ├── enndel_core_brotli.rs        # Brotli (static + dynamic)
-│   ├── enndel_core_config.rs        # Config (num_cpus)
-│   └── enndel_core_state.rs         # App state
-├── benchmark.sh                     # Benchmark suite
-├── BENCHMARK.md                     # Results & analysis
-├── Cargo.toml                       # Dependencies
-└── README.md                        # This file
-```
-
-## 🔧 Архитектура
-
-### V8 Isolate Pool
-
-Создаётся N потоков (по числу CPU), каждый поток:
-1. Имеет собственный V8 isolate (решает проблему !Send + !Sync)
-2. Получает задачи из общей mpsc очереди
-3. Возвращает результат через oneshot канал
-
-```rust
-let v8_pool = V8Pool::new(num_cpus::get());
-let html = v8_pool.render("/shop").await?;
-```
-
-### SSR рендеринг
-
-1. Vite собирает SSR entry в IIFE формат
-2. `build-ssr-bundle.js` оборачивает IIFE и создаёт `globalThis.renderPage()`
-3. Rust загружает бандл в каждый V8 isolate при старте
-4. При запросе вызывается `globalThis.renderPage(url)` через V8
-
-### Brotli middleware
-
-Middleware проверяет:
-1. Клиент поддерживает `Accept-Encoding: br`
-2. Существует `.br` файл для запрошенного ресурса
-3. Если да - отдаёт с `Content-Encoding: br`
-4. Если нет - передаёт запрос дальше
-
-## 🎯 Status
-
-### Completed ✅
-
-- [x] V8 isolate pool (10 workers)
-- [x] Preact SSR integration
-- [x] Brotli compression (static + dynamic)
-- [x] API proxy
-- [x] **Multi-tier cache** (L1/L2 hot + RAM cold)
-- [x] **LRU eviction** (atomic counter-based)
-- [x] **Cache-line alignment** (`#[repr(align(64))]`)
-- [x] **Zero-copy Arc<str>**
-- [x] **Lock-free concurrent cache** (DashMap)
-- [x] **Auto-promotion** (Cold → Hot)
-- [x] **Comprehensive benchmarks** (curl + wrk)
-
-## 📈 Monitoring
-
-### Метрики кешей
-
-Сервер публикует две точки:
-
-- `GET /internal/metrics/cache` — JSON-снимок метрик продуктового и SSR-кэшей.
-- `GET /internal/metrics/cache/prometheus` — текст в формате Prometheus exposition v0.0.4.
-- `POST /internal/cache/products/invalidate` — ручная инвалидация критичных данных (очищает кэш, следующая выдача подтянет свежие данные).
-
-Метрики покрывают:
-
-- Lazy LRU кэш продуктов (хиты/промахи, ошибки запросов, время последней загрузки, текущий размер и ёмкость).
-- Критичный продуктовый кэш (хиты/промахи, успешные/ошибочные обновления, возраст данных).
-- Многоуровневый SSR-кэш (lookups, промоушены, рендеры, время последнего рендера, размеры cold-слоя).
-
-### Быстрый старт Prometheus
-
-```yaml
-scrape_configs:
-  - job_name: 'enddel-ssr'
-    metrics_path: /internal/metrics/cache/prometheus
-    static_configs:
-      - targets:
-          - enddel-ssr.internal:3000
-```
-
-1. Убедитесь, что Prometheus может достучаться до сервера.
-2. Добавьте job в `prometheus.yml`.
-3. Перезапустите Prometheus и проверьте `up{job="enddel-ssr"} == 1`.
-
-### Grafana
-
-Добавьте Prometheus как источник данных и настройте дашборд, например:
-
-- `rate(enddel_product_cache_lazy_misses_total[5m])` — промахи ленивого кэша.
-- `rate(enddel_ssr_cache_renders_total[5m])` — количество SSR-рендеров (ожидаемо падает после прогрева).
-- `enddel_product_cache_critical_cache_age_seconds` — возраст критичных данных (контроль TTL).
-
-## ⚙️ Конфигурация
-
-Переменные окружения:
-
-| Переменная | По умолчанию | Назначение |
-|------------|--------------|------------|
-| `PRODUCT_API_BASE` | `https://enddel.com/api` | Базовый URL для загрузки каталогов |
-| `PRODUCT_LAZY_CACHE_CAPACITY` | `256` | Максимум элементов в ленивом LRU |
-| `V8_QUEUE_CAPACITY` | `512` | Размер очереди задач V8-пула (увеличьте при burst-нагрузке) |
-| `V8_PIN_THREADS` | `false` | При `true` воркеры V8 закрепляются за отдельными CPU core |
-| `TCP_BACKLOG` | `1024` | Размер очереди pending-соединений для `TcpListener` |
-| `TOKIO_MAX_BLOCKING_THREADS` | `2 × v8_pool_size` | Лимит blocking-пула Tokio (для CPU-bound задач) |
-
-Пример файла см. [`config/.env.production.example`](config/.env.production.example).
-
-### Future Enhancements 🚀
-
-- [ ] Graceful shutdown
-- [ ] Hot reload SSR bundle
-- [ ] Request timeout
-- [ ] Error boundary для SSR
-- [ ] TTL for cache entries
-- [ ] Stale-while-revalidate
-- [ ] Pre-warming popular pages
-
-## 💰 Production Economics
-
-### AWS Cost Comparison (5B requests/day)
-
-| Solution | Infrastructure | Monthly Cost | Annual Cost |
-|----------|---------------|--------------|-------------|
-| **This Server** | 1× c6gn.16xlarge | **$1,500** | **$18,000** |
-| Next.js | 100× t3.xlarge | $6,000 | $72,000 |
-| Vercel | Managed | $2,400 | $28,800 |
-
-**Savings: $4,500/month = $54,000/year** 💰
-
-### Scaling Guide
-
-| Daily Traffic | Instance Type | vCPUs | Cost/month |
-|---------------|--------------|-------|------------|
-| < 1B | t3.medium | 2 | $30 |
-| 1-10B | c6g.xlarge | 4 | $120 |
-| 10-50B | c6gn.16xlarge | 64 | $1,500 |
-| 50-100B | 2× c7gn.16xlarge | 128 | $4,800 |
-
-## 📝 Лицензия
-
-Частный проект Enddel
+Contributions are welcome! Please open an issue or PR on GitHub.

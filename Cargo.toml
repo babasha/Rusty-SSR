@@ -1,33 +1,43 @@
 [package]
-name = "enddel-server"
+name = "rusty-ssr"
 version = "0.1.0"
 edition = "2021"
-authors = ["Enddel Team"]
-description = "High-performance SSR server for Preact with V8 isolate pool"
+authors = ["Egor Babushkin"]
+description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
+license = "MIT"
+repository = "https://github.com/yourusername/rusty-ssr"
+documentation = "https://docs.rs/rusty-ssr"
+readme = "README.md"
+keywords = ["ssr", "v8", "preact", "react", "server-side-rendering"]
+categories = ["web-programming", "caching", "asynchronous"]
 
-# Оптимизации для production
+[lib]
+name = "rusty_ssr"
+path = "src/lib.rs"
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+# Optimizations for production
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
 
+[features]
+default = ["v8-pool", "cache", "axum-integration"]
+v8-pool = ["deno_core", "serde_v8"]
+cache = ["dashmap", "parking_lot", "lru"]
+axum-integration = ["axum", "tower", "tower-http"]
+brotli-compression = ["brotli"]
+full = ["v8-pool", "cache", "axum-integration", "brotli-compression"]
+
 [dependencies]
-# Web framework
-axum = "0.7"
+# Core async runtime
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["fs", "compression-br", "trace"] }
-
-# Deno V8 integration
-deno_core = "0.322"
-serde_v8 = "0.231"
-
-# HTTP client for API proxy
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Compression
-brotli = "7.0"
+futures = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -35,10 +45,6 @@ serde_json = "1.0"
 
 # Tracing/logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Async utilities
-futures = "0.3"
 
 # System info
 num_cpus = "1.16"
@@ -46,13 +52,26 @@ num_cpus = "1.16"
 # Thread-local storage
 thread_local = "1.1"
 
-# Concurrent HashMap for cache
-dashmap = "6.1"
-parking_lot = "0.12"
-lru = "0.12"
+# V8 integration (optional)
+deno_core = { version = "0.322", optional = true }
+serde_v8 = { version = "0.231", optional = true }
+
+# Concurrent cache (optional)
+dashmap = { version = "6.1", optional = true }
+parking_lot = { version = "0.12", optional = true }
+lru = { version = "0.12", optional = true }
+
+# CPU affinity for thread pinning
 core_affinity = "0.8"
 
+# Web framework integration (optional)
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", features = ["util"], optional = true }
+tower-http = { version = "0.5", features = ["fs", "compression-br", "trace", "timeout"], optional = true }
+
+# Brotli compression (optional)
+brotli = { version = "7.0", optional = true }
+
 [dev-dependencies]
-httpmock = "0.7"
-hyper = { version = "1", features = ["full"] }
-http-body-util = "0.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"

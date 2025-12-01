@@ -1,4 +1,5 @@
-// Brotli middleware и утилиты для сжатия
+//! Brotli compression middleware for Axum
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,15 +9,27 @@ use axum::{
 };
 use brotli::enc::BrotliEncoderParams;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::fs;
 
-/// Middleware для раздачи предварительно сжатых .br файлов
+/// Middleware to serve pre-compressed .br files
 ///
-/// Если клиент поддерживает Brotli (Accept-Encoding: br) и существует .br файл,
-/// отдаём его с заголовком Content-Encoding: br
+/// If the client supports Brotli (Accept-Encoding: br) and a .br file exists,
+/// serves it with Content-Encoding: br header.
+///
+/// # Arguments
+/// * `static_dir` - Base directory for static files
+///
+/// # Example
+/// ```rust,no_run
+/// use axum::{Router, middleware};
+/// use rusty_ssr::middleware::brotli_static;
+///
+/// let app = Router::new()
+///     .layer(middleware::from_fn(brotli_static));
+/// ```
 pub async fn brotli_static(request: Request, next: Next) -> Result<Response, StatusCode> {
-    // Проверяем Accept-Encoding
+    // Check Accept-Encoding
     let accepts_brotli = request
         .headers()
         .get(header::ACCEPT_ENCODING)
@@ -28,45 +41,32 @@ pub async fn brotli_static(request: Request, next: Next) -> Result<Response, Sta
         return Ok(next.run(request).await);
     }
 
-    // Получаем путь из URI
+    // Get path from URI
     let path = request.uri().path();
 
-    // Путь к .br файлу
-    let br_path = PathBuf::from(format!("../dist/client{}.br", path));
-
-    // Проверяем существует ли .br файл
-    if !br_path.exists() || !br_path.is_file() {
+    // Skip if path contains ..
+    if path.contains("..") {
         return Ok(next.run(request).await);
     }
 
-    // Читаем .br файл
+    // Look for .br file in current directory
+    let br_path = format!(".{}.br", path);
+
+    if !Path::new(&br_path).exists() {
+        return Ok(next.run(request).await);
+    }
+
+    // Read .br file
     let content = match fs::read(&br_path).await {
         Ok(c) => c,
         Err(_) => return Ok(next.run(request).await),
     };
 
-    // Определяем Content-Type по расширению оригинального файла
-    let content_type = if path.ends_with(".js") {
-        "application/javascript; charset=UTF-8"
-    } else if path.ends_with(".css") {
-        "text/css; charset=UTF-8"
-    } else if path.ends_with(".html") {
-        "text/html; charset=UTF-8"
-    } else if path.ends_with(".json") {
-        "application/json; charset=UTF-8"
-    } else if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".woff2") {
-        "font/woff2"
-    } else if path.ends_with(".woff") {
-        "font/woff"
-    } else {
-        "application/octet-stream"
-    };
+    // Determine Content-Type
+    let content_type = guess_content_type(path);
 
     tracing::debug!("Serving Brotli: {} ({} bytes)", path, content.len());
 
-    // Возвращаем сжатый файл с правильными заголовками
     Ok((
         StatusCode::OK,
         [
@@ -83,11 +83,19 @@ pub async fn brotli_static(request: Request, next: Next) -> Result<Response, Sta
         .into_response())
 }
 
-/// Middleware для динамического Brotli сжатия HTML ответов от SSR
+/// Middleware for dynamic Brotli compression of HTML responses
 ///
-/// Проверяет Accept-Encoding: br и сжимает HTML на лету
-pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Response, StatusCode> {
-    // Проверяем поддержку Brotli
+/// Compresses HTML responses on-the-fly if the client supports Brotli.
+///
+/// # Example
+/// ```rust,no_run
+/// use axum::{Router, middleware};
+/// use rusty_ssr::middleware::brotli_compress;
+///
+/// let app = Router::new()
+///     .layer(middleware::from_fn(brotli_compress));
+/// ```
+pub async fn brotli_compress(request: Request, next: Next) -> Result<Response, StatusCode> {
     let accepts_brotli = request
         .headers()
         .get(header::ACCEPT_ENCODING)
@@ -97,11 +105,11 @@ pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Respon
 
     let response = next.run(request).await;
 
-    // Если клиент не поддерживает brotli или это не HTML - возвращаем как есть
     if !accepts_brotli {
         return Ok(response);
     }
 
+    // Only compress HTML
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -112,17 +120,17 @@ pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Respon
         return Ok(response);
     }
 
-    // Извлекаем body
+    // Extract body
     let (parts, body) = response.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    // Сжимаем с помощью Brotli (качество 4 для скорости)
+    // Compress with Brotli (quality 4 for speed)
     let mut compressed = Vec::new();
     let params = BrotliEncoderParams {
-        quality: 4, // Быстрее чем 6, но хорошая компрессия для HTML
+        quality: 4,
         ..Default::default()
     };
 
@@ -132,7 +140,7 @@ pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Respon
     }
     drop(compressor);
 
-    // Создаём новый response с сжатыми данными
+    // Create response with compressed data
     let mut response = Response::from_parts(parts, Body::from(compressed));
     response
         .headers_mut()
@@ -142,4 +150,25 @@ pub async fn brotli_compress_html(request: Request, next: Next) -> Result<Respon
         .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
 
     Ok(response)
+}
+
+/// Guess content type from file extension
+fn guess_content_type(path: &str) -> &'static str {
+    if path.ends_with(".js") {
+        "application/javascript; charset=UTF-8"
+    } else if path.ends_with(".css") {
+        "text/css; charset=UTF-8"
+    } else if path.ends_with(".html") {
+        "text/html; charset=UTF-8"
+    } else if path.ends_with(".json") {
+        "application/json; charset=UTF-8"
+    } else if path.ends_with(".svg") {
+        "image/svg+xml"
+    } else if path.ends_with(".woff2") {
+        "font/woff2"
+    } else if path.ends_with(".woff") {
+        "font/woff"
+    } else {
+        "application/octet-stream"
+    }
 }
