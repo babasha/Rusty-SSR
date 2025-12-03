@@ -2,7 +2,7 @@
 
 **The fastest SSR engine for Rust. Period.**
 
-Render 88,000+ pages per second with sub-millisecond latency. Drop-in replacement for Node.js SSR that's 50x faster.
+Render 95,000+ pages per second with sub-millisecond latency. Drop-in replacement for Node.js SSR that's 50x faster.
 
 [![Crates.io](https://img.shields.io/crates/v/rusty-ssr.svg)](https://crates.io/crates/rusty-ssr)
 [![Documentation](https://docs.rs/rusty-ssr/badge.svg)](https://docs.rs/rusty-ssr)
@@ -14,13 +14,13 @@ Render 88,000+ pages per second with sub-millisecond latency. Drop-in replacemen
 ┌─────────────────────────────────────────────────────────────┐
 │                    STRESS TEST (30 seconds)                 │
 ├─────────────────────────────────────────────────────────────┤
-│  Requests/sec:      88,731 RPS                              │
-│  Total requests:    2,666,835                               │
-│  Data transferred:  159 GB                                  │
+│  Requests/sec:      95,363 RPS                              │
+│  Total requests:    2,869,878                               │
+│  Data transferred:  171 GB                                  │
 ├─────────────────────────────────────────────────────────────┤
-│  Latency p50:       1.05ms                                  │
-│  Latency p99:       6.12ms                                  │
-│  Max latency:       183ms                                   │
+│  Latency p50:       0.46ms                                  │
+│  Latency p99:       4.60ms                                  │
+│  Max latency:       45.7ms                                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -28,11 +28,11 @@ Render 88,000+ pages per second with sub-millisecond latency. Drop-in replacemen
 
 | Engine | RPS | p99 Latency | Memory |
 |--------|-----|-------------|--------|
-| **Rusty SSR** | **88,731** | **6ms** | ~200MB |
+| **Rusty SSR** | **95,363** | **4.6ms** | ~200MB |
 | Next.js (Node) | 500-2,000 | 50-200ms | ~500MB+ |
 | Nuxt (Node) | 500-1,500 | 40-150ms | ~500MB+ |
 
-**50x faster throughput. 30x lower latency. 60% less memory.**
+**50x faster throughput. 40x lower latency. 60% less memory.**
 
 ## Why Rusty SSR?
 
