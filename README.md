@@ -273,6 +273,57 @@ rusty-ssr = { version = "0.1", default-features = false, features = ["v8-pool"] 
 rusty-ssr = { version = "0.1", features = ["full"] }
 ```
 
+## Testing & Benchmarks
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run integration tests only
+cargo test --test integration_tests
+
+# Run with verbose output
+cargo test -- --nocapture
+```
+
+Integration tests cover:
+- V8 pool configuration
+- DashMap concurrent cache operations
+- LRU cache eviction behavior
+- Async patterns (tokio channels, timeouts)
+- Thread safety (Arc, Mutex, mpsc)
+- URL parsing and JSON serialization
+
+### Running Benchmarks
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run SSR benchmarks only
+cargo bench --bench ssr_benchmark
+
+# Run cache benchmarks only
+cargo bench --bench cache_benchmark
+```
+
+**SSR Benchmarks** (`ssr_benchmark`):
+- Pool config creation overhead
+- String operations (small/medium/large HTML)
+- JSON serialization performance
+- Channel throughput (request queue simulation)
+
+**Cache Benchmarks** (`cache_benchmark`):
+- DashMap concurrent read/write (1, 2, 4, 8 threads)
+- DashMap sharding (sequential vs random keys)
+- L1/L2 cache hit performance
+- LRU eviction overhead (128, 512, 2048 entries)
+- Arc<str> vs String cloning
+
+Results are saved to `target/criterion/` with HTML reports.
+
 ## Architecture
 
 ```
