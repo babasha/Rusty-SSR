@@ -124,6 +124,33 @@ impl SsrEngine {
         Ok(html)
     }
 
+    /// Render a URL with JSON data (serde_json::Value)
+    ///
+    /// Convenience method that serializes the Value to a string.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # async fn example(engine: SsrEngine) {
+    /// use serde_json::json;
+    ///
+    /// let data = json!({
+    ///     "user": { "name": "John" },
+    ///     "products": [1, 2, 3]
+    /// });
+    /// let html = engine.render_json("/products", data).await.unwrap();
+    /// # }
+    /// ```
+    #[cfg(all(feature = "v8-pool", feature = "cache"))]
+    pub async fn render_json(
+        &self,
+        url: &str,
+        data: serde_json::Value,
+    ) -> SsrResult<Arc<str>> {
+        let data_str = data.to_string();
+        self.render_with_data(url, &data_str).await
+    }
+
     /// Render without caching (always hits V8)
     #[cfg(feature = "v8-pool")]
     pub async fn render_uncached(&self, url: &str, data: &str) -> SsrResult<String> {
@@ -131,6 +158,16 @@ impl SsrEngine {
             .render_with_data(url.to_string(), data.to_string())
             .await
             .map_err(SsrError::JsExecution)
+    }
+
+    /// Render without caching with JSON data
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_uncached_json(
+        &self,
+        url: &str,
+        data: serde_json::Value,
+    ) -> SsrResult<String> {
+        self.render_uncached(url, &data.to_string()).await
     }
 
     /// Clear the SSR cache
