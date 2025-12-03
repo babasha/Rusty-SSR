@@ -108,20 +108,18 @@ impl SsrCache {
         let start = Instant::now();
         self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
 
-        // 1. Check hot cache (L1/L2)
+        // 1. Check hot cache (L1/L2) - use peek() for read-only access
         let hot = self
             .hot_cache
             .get_or(|| RefCell::new(HotCache::with_ttl(self.ttl_secs)));
-        let hot_ref = hot.borrow();
 
-        if let Some(html) = hot_ref.get(url_hash) {
+        if let Some(html) = hot.borrow().peek(url_hash) {
             self.metrics.hot_hits.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .last_access_ns
                 .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             return Some(html);
         }
-        drop(hot_ref);
 
         // 2. Check cold cache (RAM)
         if let Some(html) = self.cold_cache.get(url_hash) {

@@ -14,8 +14,9 @@
 //! - **Auto-promotion**: Cold hits are promoted to hot cache
 
 mod cold;
-mod hot;
+pub mod hot;  // Public for benchmarking
 mod ssr;
 mod utils;
 
 pub use ssr::{SsrCache, CacheMetrics};
+pub use hot::HotCache;
