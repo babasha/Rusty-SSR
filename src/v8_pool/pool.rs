@@ -4,6 +4,8 @@ use core_affinity::CoreId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 use super::{renderer, runtime};
@@ -20,6 +22,9 @@ pub struct V8PoolConfig {
     /// Pin workers to specific CPU cores
     pub pin_threads: bool,
 
+    /// Timeout for enqueueing render requests (None = block)
+    pub request_timeout: Option<Duration>,
+
     /// Name of the render function in JS
     pub render_function: String,
 }
@@ -30,6 +35,7 @@ impl Default for V8PoolConfig {
             num_threads: num_cpus::get(),
             queue_capacity: 512,
             pin_threads: false,
+            request_timeout: Some(Duration::from_secs(30)),
             render_function: "renderPage".to_string(),
         }
     }
@@ -42,6 +48,32 @@ struct RenderRequest {
     render_function: String,
     response_tx: oneshot::Sender<Result<String, String>>,
 }
+
+/// Errors returned by the V8 pool
+#[derive(Debug, Clone)]
+pub enum PoolError {
+    /// Timed out waiting to enqueue work
+    Timeout,
+    /// Pool is not accepting new work
+    Disconnected,
+    /// Worker crashed or dropped the response channel
+    WorkerCrashed,
+    /// Rendering failed inside V8
+    Render(String),
+}
+
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolError::Timeout => write!(f, "Timed out waiting for a free V8 worker"),
+            PoolError::Disconnected => write!(f, "V8 pool is not accepting requests"),
+            PoolError::WorkerCrashed => write!(f, "V8 worker crashed while rendering"),
+            PoolError::Render(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PoolError {}
 
 /// V8 Thread Pool for parallel SSR rendering
 ///
@@ -111,26 +143,48 @@ impl V8Pool {
     }
 
     /// Render a URL to HTML
-    pub async fn render(&self, url: String) -> Result<String, String> {
+    pub async fn render(&self, url: String) -> Result<String, PoolError> {
         self.render_with_data(url, "{}".to_string()).await
     }
 
     /// Render a URL to HTML with custom data
-    pub async fn render_with_data(&self, url: String, data: String) -> Result<String, String> {
+    pub async fn render_with_data(&self, url: String, data: String) -> Result<String, PoolError> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.request_tx
-            .send(RenderRequest {
-                url,
-                data,
-                render_function: self.config.render_function.clone(),
-                response_tx,
-            })
-            .map_err(|_| "Failed to send render request: pool may be shutting down".to_string())?;
+        let request = RenderRequest {
+            url,
+            data,
+            render_function: self.config.render_function.clone(),
+            response_tx,
+        };
 
-        response_rx
-            .await
-            .map_err(|_| "Failed to receive render response: worker may have crashed".to_string())?
+        let deadline = self.config.request_timeout.map(|t| Instant::now() + t);
+        let mut req = request;
+
+        loop {
+            match self.request_tx.try_send(req) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(r)) => {
+                    if let Some(dl) = deadline {
+                        if Instant::now() >= dl {
+                            return Err(PoolError::Timeout);
+                        }
+                    }
+                    req = r;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(PoolError::Disconnected);
+                }
+            }
+        }
+
+        match response_rx.await {
+            Ok(Ok(html)) => Ok(html),
+            Ok(Err(msg)) => Err(PoolError::Render(msg)),
+            Err(_) => Err(PoolError::WorkerCrashed),
+        }
     }
 
     /// Get the number of active workers
@@ -252,23 +306,30 @@ fn prefetch_data(data: &str) {
     }
 }
 
-#[cfg(test)]
 impl V8Pool {
     /// Create a stub pool for testing (no actual V8)
-    pub fn new_stub() -> Self {
-        let (request_tx, request_rx) = mpsc::sync_channel(0);
+    #[allow(dead_code)]
+    pub fn new_stub_with(config: V8PoolConfig) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel(config.queue_capacity);
         Self {
-            config: V8PoolConfig {
-                num_threads: 0,
-                queue_capacity: 0,
-                pin_threads: false,
-                render_function: "renderPage".to_string(),
-            },
+            config,
             request_tx,
             request_rx: Arc::new(Mutex::new(request_rx)),
             worker_count: Arc::new(Mutex::new(0)),
             core_affinity: None,
             next_core: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Create a stub pool with default test config (no workers)
+    #[allow(dead_code)]
+    pub fn new_stub() -> Self {
+        Self::new_stub_with(V8PoolConfig {
+            num_threads: 0,
+            queue_capacity: 0,
+            pin_threads: false,
+            request_timeout: Some(Duration::from_millis(10)),
+            render_function: "renderPage".to_string(),
+        })
     }
 }

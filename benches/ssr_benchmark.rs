@@ -28,6 +28,7 @@ fn bench_pool_config(c: &mut Criterion) {
                 num_threads: 4,
                 queue_capacity: 1024,
                 pin_threads: false,
+                request_timeout: Some(Duration::from_secs(30)),
                 render_function: "renderPage".to_string(),
             };
             black_box(config)

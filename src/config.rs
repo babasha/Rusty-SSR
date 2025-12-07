@@ -24,7 +24,7 @@ pub struct SsrConfig {
     /// Cache TTL (None = no expiration)
     pub cache_ttl: Option<Duration>,
 
-    /// Request timeout
+    /// Request timeout for enqueueing render jobs
     pub request_timeout: Option<Duration>,
 
     /// Name of the global render function in JS bundle

@@ -6,7 +6,7 @@ use crate::config::{SsrConfig, SsrConfigBuilder};
 use crate::error::{SsrError, SsrResult};
 
 #[cfg(feature = "v8-pool")]
-use crate::v8_pool::V8Pool;
+use crate::v8_pool::{PoolError, V8Pool};
 
 #[cfg(feature = "cache")]
 use crate::cache::SsrCache;
@@ -56,6 +56,7 @@ impl SsrEngine {
                 num_threads: config.pool_size,
                 queue_capacity: config.queue_capacity,
                 pin_threads: config.pin_threads,
+                request_timeout: config.request_timeout,
                 render_function: config.render_function.clone(),
             })
         };
@@ -114,7 +115,7 @@ impl SsrEngine {
             .v8_pool
             .render_with_data(url.to_string(), data.to_string())
             .await
-            .map_err(SsrError::JsExecution)?;
+            .map_err(Self::map_pool_error)?;
 
         let html: Arc<str> = Arc::from(html.as_str());
 
@@ -157,7 +158,7 @@ impl SsrEngine {
         self.v8_pool
             .render_with_data(url.to_string(), data.to_string())
             .await
-            .map_err(SsrError::JsExecution)
+            .map_err(Self::map_pool_error)
     }
 
     /// Render without caching with JSON data
@@ -212,5 +213,19 @@ impl SsrConfigBuilder {
     /// Build the configuration and create an SsrEngine
     pub fn build_engine(self) -> SsrResult<SsrEngine> {
         SsrEngine::new(self.build())
+    }
+}
+
+impl SsrEngine {
+    #[cfg(feature = "v8-pool")]
+    fn map_pool_error(err: PoolError) -> SsrError {
+        match err {
+            PoolError::Timeout => SsrError::Timeout,
+            PoolError::Disconnected => SsrError::PoolFull,
+            PoolError::WorkerCrashed => {
+                SsrError::JsExecution("V8 worker crashed".to_string())
+            }
+            PoolError::Render(msg) => SsrError::JsExecution(msg),
+        }
     }
 }

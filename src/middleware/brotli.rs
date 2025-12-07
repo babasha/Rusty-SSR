@@ -17,9 +17,6 @@ use tokio::fs;
 /// If the client supports Brotli (Accept-Encoding: br) and a .br file exists,
 /// serves it with Content-Encoding: br header.
 ///
-/// # Arguments
-/// * `static_dir` - Base directory for static files
-///
 /// # Example
 /// ```rust,no_run
 /// use axum::{Router, middleware};

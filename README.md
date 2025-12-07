@@ -99,7 +99,7 @@ async fn main() {
     let engine = Arc::new(
         SsrEngine::builder()
             .bundle_path("ssr-bundle.js")
-            .cache_size(500)        // 500MB cache
+            .cache_size(500)        // ~500 cached pages (entries, not MB)
             .cache_ttl_secs(300)    // 5 min TTL
             .build_engine()
             .expect("Failed to create SSR engine")
@@ -191,15 +191,15 @@ let html = engine.render_uncached("/admin", "{}").await?;
 ### Configuration
 
 ```rust
-let engine = SsrEngine::builder()
-    .bundle_path("ssr-bundle.js")     // Path to JS bundle
-    .pool_size(num_cpus::get())       // V8 workers (default: CPU count)
-    .queue_capacity(512)               // Task queue size
-    .pin_threads(true)                 // Pin workers to CPU cores
-    .cache_size(500)                   // Cache size in MB
-    .cache_ttl_secs(300)               // Cache TTL (0 = forever)
-    .render_function("renderPage")     // JS function name
-    .build_engine()?;
+    let engine = SsrEngine::builder()
+        .bundle_path("ssr-bundle.js")     // Path to JS bundle
+        .pool_size(num_cpus::get())       // V8 workers (default: CPU count)
+        .queue_capacity(512)               // Task queue size
+        .pin_threads(true)                 // Pin workers to CPU cores
+        .cache_size(500)                   // Number of cached entries
+        .cache_ttl_secs(300)               // Cache TTL (0 = forever)
+        .render_function("renderPage")     // JS function name
+        .build_engine()?;
 ```
 
 ### Cache Metrics

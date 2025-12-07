@@ -21,9 +21,10 @@ use super::utils::hash_url;
 ///
 /// Entries found in cold cache are automatically promoted to hot cache.
 pub struct SsrCache {
-    hot_cache: ThreadLocal<RefCell<HotCache>>,
+    hot_cache: ThreadLocal<RefCell<HotCacheState>>,
     cold_cache: Arc<ColdCache>,
     ttl_secs: u64,
+    generation: AtomicU64,
     metrics: Arc<CacheMetricsInner>,
 }
 
@@ -66,6 +67,11 @@ pub struct CacheMetrics {
     pub hit_rate: f64,
 }
 
+struct HotCacheState {
+    generation: u64,
+    cache: HotCache,
+}
+
 impl SsrCache {
     /// Create a new SSR cache
     ///
@@ -95,6 +101,7 @@ impl SsrCache {
             hot_cache: ThreadLocal::new(),
             cold_cache: Arc::new(ColdCache::with_ttl(max_cold_entries, ttl_secs)),
             ttl_secs,
+            generation: AtomicU64::new(0),
             metrics: Arc::new(CacheMetricsInner::default()),
         }
     }
@@ -109,11 +116,8 @@ impl SsrCache {
         self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
 
         // 1. Check hot cache (L1/L2) - use peek() for read-only access
-        let hot = self
-            .hot_cache
-            .get_or(|| RefCell::new(HotCache::with_ttl(self.ttl_secs)));
-
-        if let Some(html) = hot.borrow().peek(url_hash) {
+        let hot = self.get_or_init_hot_cache();
+        if let Some(html) = hot.borrow().cache.peek(url_hash) {
             self.metrics.hot_hits.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .last_access_ns
@@ -127,7 +131,7 @@ impl SsrCache {
 
             // Promote to hot cache
             let mut hot_ref = hot.borrow_mut();
-            hot_ref.insert(url_hash, Arc::clone(&html));
+            hot_ref.cache.insert(url_hash, Arc::clone(&html));
             self.metrics.promotions.fetch_add(1, Ordering::Relaxed);
 
             self.metrics
@@ -152,16 +156,16 @@ impl SsrCache {
         }
 
         // Insert into hot cache
-        let hot = self
-            .hot_cache
-            .get_or(|| RefCell::new(HotCache::with_ttl(self.ttl_secs)));
+        let hot = self.get_or_init_hot_cache();
         let mut hot_ref = hot.borrow_mut();
-        hot_ref.insert(url_hash, html);
+        hot_ref.cache.insert(url_hash, html);
     }
 
-    /// Clear the cache
+    /// Clear the cache, including hot caches and metrics
     pub fn clear(&self) {
         self.cold_cache.clear();
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.reset_metrics();
     }
 
     /// Get current cold cache size
@@ -194,6 +198,39 @@ impl SsrCache {
             },
         }
     }
+
+    fn reset_metrics(&self) {
+        self.metrics.lookups.store(0, Ordering::Relaxed);
+        self.metrics.hot_hits.store(0, Ordering::Relaxed);
+        self.metrics.cold_hits.store(0, Ordering::Relaxed);
+        self.metrics.misses.store(0, Ordering::Relaxed);
+        self.metrics.promotions.store(0, Ordering::Relaxed);
+        self.metrics.insertions.store(0, Ordering::Relaxed);
+        self.metrics.evictions.store(0, Ordering::Relaxed);
+        self.metrics
+            .last_access_ns
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn get_or_init_hot_cache(&self) -> &RefCell<HotCacheState> {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let hot = self.hot_cache.get_or(|| {
+            RefCell::new(HotCacheState {
+                generation,
+                cache: HotCache::with_ttl(self.ttl_secs),
+            })
+        });
+
+        {
+            let mut state = hot.borrow_mut();
+            if state.generation != generation {
+                state.cache.clear();
+                state.generation = generation;
+            }
+        }
+
+        hot
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +257,23 @@ mod tests {
         let metrics = cache.metrics();
         assert_eq!(metrics.insertions, 1);
         assert_eq!(metrics.lookups, 2);
+        assert_eq!(metrics.misses, 1);
+    }
+
+    #[test]
+    fn test_clear_removes_hot_and_resets_metrics() {
+        let cache = SsrCache::with_ttl(16, 10);
+
+        cache.insert("/hot", Arc::from("html"));
+        assert!(cache.try_get("/hot").is_some(), "hot cache should have entry");
+
+        cache.clear();
+
+        // After clearing, both caches should miss and metrics reset
+        assert!(cache.try_get("/hot").is_none(), "hot cache should be cleared");
+        let metrics = cache.metrics();
+        assert_eq!(metrics.insertions, 0);
+        assert_eq!(metrics.lookups, 1);
         assert_eq!(metrics.misses, 1);
     }
 }

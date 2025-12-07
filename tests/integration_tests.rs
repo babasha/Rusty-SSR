@@ -26,6 +26,11 @@ mod pool_config_tests {
         assert_eq!(config.queue_capacity, 512, "Default queue capacity should be 512");
         assert!(!config.pin_threads, "Thread pinning should be disabled by default");
         assert_eq!(
+            config.request_timeout,
+            Some(std::time::Duration::from_secs(30)),
+            "Default enqueue timeout should be 30s"
+        );
+        assert_eq!(
             config.render_function, "renderPage",
             "Default render function should be 'renderPage'"
         );
@@ -37,12 +42,14 @@ mod pool_config_tests {
             num_threads: 4,
             queue_capacity: 1024,
             pin_threads: true,
+            request_timeout: Some(std::time::Duration::from_secs(1)),
             render_function: "customRender".to_string(),
         };
 
         assert_eq!(config.num_threads, 4);
         assert_eq!(config.queue_capacity, 1024);
         assert!(config.pin_threads);
+        assert_eq!(config.request_timeout, Some(std::time::Duration::from_secs(1)));
         assert_eq!(config.render_function, "customRender");
     }
 
@@ -52,6 +59,7 @@ mod pool_config_tests {
             num_threads: 8,
             queue_capacity: 256,
             pin_threads: false,
+            request_timeout: None,
             render_function: "render".to_string(),
         };
 
@@ -60,7 +68,38 @@ mod pool_config_tests {
         assert_eq!(config.num_threads, cloned.num_threads);
         assert_eq!(config.queue_capacity, cloned.queue_capacity);
         assert_eq!(config.pin_threads, cloned.pin_threads);
+        assert_eq!(config.request_timeout, cloned.request_timeout);
         assert_eq!(config.render_function, cloned.render_function);
+    }
+}
+
+// ============================================================================
+// V8 Pool Timeout Tests
+// ============================================================================
+
+#[cfg(all(test, feature = "v8-pool"))]
+mod pool_timeout_tests {
+    use rusty_ssr::v8_pool::{PoolError, V8Pool, V8PoolConfig};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_queue_timeout_errors() {
+        let pool = V8Pool::new_stub_with(V8PoolConfig {
+            num_threads: 0,
+            queue_capacity: 0,
+            pin_threads: false,
+            request_timeout: Some(Duration::from_millis(5)),
+            render_function: "renderPage".to_string(),
+        });
+
+        let result = pool
+            .render_with_data("/timeout".to_string(), "{}".to_string())
+            .await;
+
+        match result {
+            Err(PoolError::Timeout) => {}
+            other => panic!("Expected timeout error, got {:?}", other),
+        }
     }
 }
 

@@ -19,6 +19,21 @@ const BROWSER_POLYFILLS: &str = r#"
 globalThis.window = globalThis;
 globalThis.self = globalThis;
 
+// Minimal timers (no real scheduling; executes immediately)
+let __rustyTimerId = 0;
+globalThis.setTimeout = (cb, _ms, ...args) => {
+    __rustyTimerId += 1;
+    if (typeof cb === 'function') { cb(...args); }
+    return __rustyTimerId;
+};
+globalThis.clearTimeout = () => {};
+globalThis.setInterval = (cb, _ms, ...args) => {
+    __rustyTimerId += 1;
+    if (typeof cb === 'function') { cb(...args); }
+    return __rustyTimerId;
+};
+globalThis.clearInterval = () => {};
+
 // Document mock
 globalThis.document = {
     createElement: (tag) => ({
@@ -167,16 +182,21 @@ globalThis.console = globalThis.console || {
 pub fn init_bundle<P: AsRef<Path>>(path: P) -> SsrResult<()> {
     let path = path.as_ref();
 
-    SSR_BUNDLE.get_or_init(|| {
-        tracing::info!("📦 Loading SSR bundle from {:?}", path);
+    if SSR_BUNDLE.get().is_some() {
+        return Ok(());
+    }
 
-        let user_bundle = std::fs::read_to_string(path).unwrap_or_else(|e| {
-            panic!("Failed to read SSR bundle from {:?}: {}", path, e);
-        });
+    tracing::info!("📦 Loading SSR bundle from {:?}", path);
 
-        // Prepend browser polyfills
-        format!("{}\n{}", BROWSER_POLYFILLS, user_bundle)
-    });
+    let user_bundle = std::fs::read_to_string(path).map_err(|e| {
+        SsrError::BundleLoad(format!("Failed to read SSR bundle from {:?}: {}", path, e))
+    })?;
+
+    let full_bundle = format!("{}\n{}", BROWSER_POLYFILLS, user_bundle);
+
+    SSR_BUNDLE
+        .set(full_bundle)
+        .map_err(|_| SsrError::BundleLoad("Bundle already initialized".to_string()))?;
 
     Ok(())
 }
