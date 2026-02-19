@@ -11,6 +11,7 @@ use thread_local::ThreadLocal;
 
 use super::cold::ColdCache;
 use super::hot::HotCache;
+use super::padded::CachePadded;
 use super::utils::hash_url;
 
 /// Multi-tier SSR cache
@@ -30,14 +31,14 @@ pub struct SsrCache {
 
 #[derive(Default)]
 struct CacheMetricsInner {
-    lookups: AtomicU64,
-    hot_hits: AtomicU64,
-    cold_hits: AtomicU64,
-    misses: AtomicU64,
-    promotions: AtomicU64,
-    insertions: AtomicU64,
-    evictions: AtomicU64,
-    last_access_ns: AtomicU64,
+    lookups: CachePadded<AtomicU64>,
+    hot_hits: CachePadded<AtomicU64>,
+    cold_hits: CachePadded<AtomicU64>,
+    misses: CachePadded<AtomicU64>,
+    promotions: CachePadded<AtomicU64>,
+    insertions: CachePadded<AtomicU64>,
+    evictions: CachePadded<AtomicU64>,
+    last_access_ns: CachePadded<AtomicU64>,
 }
 
 /// Cache metrics snapshot

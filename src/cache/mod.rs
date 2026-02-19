@@ -15,6 +15,7 @@
 
 mod cold;
 pub mod hot;  // Public for benchmarking
+mod padded;
 mod ssr;
 mod utils;
 

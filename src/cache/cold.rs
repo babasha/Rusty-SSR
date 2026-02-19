@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::padded::CachePadded;
+
 /// Optimal shard count for 8+ concurrent threads.
 /// Benchmarked values: 16=51M, 32=57M, 64=59M, 128=60.6M, 256=60.3M elem/s
 const OPTIMAL_SHARD_COUNT: usize = 128;
@@ -26,7 +28,7 @@ struct CacheEntry {
 pub struct ColdCache {
     cache: DashMap<u64, CacheEntry>,
     max_entries: usize,
-    access_counter: AtomicU64,
+    access_counter: CachePadded<AtomicU64>,
     ttl: Option<Duration>,
 }
 
@@ -37,7 +39,7 @@ impl ColdCache {
         Self {
             cache: DashMap::with_capacity_and_shard_amount(max_entries, OPTIMAL_SHARD_COUNT),
             max_entries,
-            access_counter: AtomicU64::new(0),
+            access_counter: CachePadded::new(AtomicU64::new(0)),
             ttl: None,
         }
     }
@@ -47,7 +49,7 @@ impl ColdCache {
         Self {
             cache: DashMap::with_capacity_and_shard_amount(max_entries, OPTIMAL_SHARD_COUNT),
             max_entries,
-            access_counter: AtomicU64::new(0),
+            access_counter: CachePadded::new(AtomicU64::new(0)),
             ttl: if ttl_secs > 0 {
                 Some(Duration::from_secs(ttl_secs))
             } else {
