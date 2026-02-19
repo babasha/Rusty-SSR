@@ -400,6 +400,145 @@ mod thread_safety_tests {
 }
 
 // ============================================================================
+// V8 Rendering Tests (actual JS execution)
+// ============================================================================
+
+#[cfg(all(test, feature = "v8-pool", feature = "cache"))]
+mod v8_render_tests {
+    use rusty_ssr::SsrEngine;
+    use std::sync::OnceLock;
+
+    const TEST_BUNDLE: &str = r#"
+        globalThis.renderPage = async function(url, data) {
+            let body = '<h1>' + url + '</h1>';
+            if (data && Object.keys(data).length > 0) {
+                body += '<pre>' + JSON.stringify(data) + '</pre>';
+            }
+            return '<html><body>' + body + '</body></html>';
+        };
+    "#;
+
+    fn get_engine() -> &'static SsrEngine {
+        static ENGINE: OnceLock<SsrEngine> = OnceLock::new();
+        ENGINE.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let bundle_path = dir.path().join("test-bundle.js");
+            std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+
+            SsrEngine::builder()
+                .bundle_path(&bundle_path)
+                .pool_size(2)
+                .cache_size(100)
+                .cache_ttl_secs(60)
+                .build_engine()
+                .expect("Failed to create test engine")
+        })
+    }
+
+    #[tokio::test]
+    async fn test_basic_render() {
+        let engine = get_engine();
+        let html = engine.render("/home").await.unwrap();
+
+        assert!(html.contains("<html>"), "should return valid HTML");
+        assert!(html.contains("<h1>/home</h1>"), "should contain the URL");
+    }
+
+    #[tokio::test]
+    async fn test_render_with_json_data() {
+        let engine = get_engine();
+        let data = serde_json::json!({
+            "user": "Alice",
+            "count": 42
+        });
+
+        let html = engine.render_json("/profile", data).await.unwrap();
+
+        assert!(html.contains("/profile"));
+        assert!(html.contains("Alice"));
+        assert!(html.contains("42"));
+    }
+
+    #[tokio::test]
+    async fn test_render_with_empty_data() {
+        let engine = get_engine();
+        let html = engine.render("/empty").await.unwrap();
+
+        assert!(html.contains("<h1>/empty</h1>"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_renders() {
+        let engine = get_engine();
+
+        let mut results = vec![];
+        for i in 0..10 {
+            let url = format!("/page/{}", i);
+            let html = engine.render(&url).await.unwrap();
+            results.push((url, html));
+        }
+
+        for (url, html) in &results {
+            assert!(
+                html.contains(url.as_str()),
+                "render for {} should contain the URL in output",
+                url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_after_render() {
+        let engine = get_engine();
+
+        // First render — cache miss, goes to V8
+        let html1 = engine.render("/cached-page").await.unwrap();
+        let metrics1 = engine.cache_metrics();
+
+        // Second render — should be a cache hit
+        let html2 = engine.render("/cached-page").await.unwrap();
+        let metrics2 = engine.cache_metrics();
+
+        assert_eq!(*html1, *html2, "cached result should match original");
+        assert!(
+            metrics2.hot_hits + metrics2.cold_hits > metrics1.hot_hits + metrics1.cold_hits,
+            "cache hits should increase"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_forces_rerender() {
+        let engine = get_engine();
+
+        // Render and cache
+        let _ = engine.render("/to-invalidate").await.unwrap();
+        assert!(engine.cache().try_get("/to-invalidate").is_some());
+
+        // Invalidate
+        engine.invalidate("/to-invalidate");
+        assert!(engine.cache().try_get("/to-invalidate").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_render_special_chars_in_url() {
+        let engine = get_engine();
+        let html = engine.render("/page?q=hello&lang=en").await.unwrap();
+
+        assert!(html.contains("<html>"), "should render despite special chars in URL");
+    }
+
+    #[tokio::test]
+    async fn test_render_with_invalid_json_rejected() {
+        let engine = get_engine();
+        let result = engine
+            .render_with_data("/bad", "not valid json")
+            .await;
+
+        assert!(result.is_err(), "invalid JSON data should be rejected");
+    }
+}
+
+// ============================================================================
 // URL Parsing Tests
 // ============================================================================
 

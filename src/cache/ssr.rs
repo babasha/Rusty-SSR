@@ -150,16 +150,43 @@ impl SsrCache {
         let url_hash = hash_url(url);
 
         // Insert into cold cache
-        let evicted = self.cold_cache.insert(url_hash, Arc::clone(&html));
+        let evicted = self.cold_cache.insert(url_hash, url, Arc::clone(&html));
         self.metrics.insertions.fetch_add(1, Ordering::Relaxed);
-        if evicted.is_some() {
-            self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+        if evicted > 0 {
+            self.metrics.evictions.fetch_add(evicted as u64, Ordering::Relaxed);
         }
 
         // Insert into hot cache
         let hot = self.get_or_init_hot_cache();
         let mut hot_ref = hot.borrow_mut();
         hot_ref.cache.insert(url_hash, html);
+    }
+
+    /// Invalidate a single cached URL
+    ///
+    /// Removes from cold cache and bumps generation to clear hot caches.
+    /// Other hot-cached entries will be re-promoted from cold on next access.
+    pub fn invalidate(&self, url: &str) {
+        let url_hash = hash_url(url);
+        if self.cold_cache.remove(url_hash) {
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Invalidate all cached URLs that start with the given prefix
+    ///
+    /// Example: `cache.invalidate_prefix("/products")` removes
+    /// `/products`, `/products/123`, `/products/foo/bar`, etc.
+    ///
+    /// Also bumps the generation counter to clear all hot caches,
+    /// ensuring stale entries don't survive in thread-local caches.
+    pub fn invalidate_prefix(&self, prefix: &str) -> usize {
+        let removed = self.cold_cache.remove_by_prefix(prefix);
+        if removed > 0 {
+            // Bump generation to invalidate hot caches that may hold stale entries
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Clear the cache, including hot caches and metrics
@@ -259,6 +286,35 @@ mod tests {
         assert_eq!(metrics.insertions, 1);
         assert_eq!(metrics.lookups, 2);
         assert_eq!(metrics.misses, 1);
+    }
+
+    #[test]
+    fn test_invalidate_single() {
+        let cache = SsrCache::new(100);
+
+        cache.insert("/a", Arc::from("html_a"));
+        cache.insert("/b", Arc::from("html_b"));
+
+        cache.invalidate("/a");
+
+        assert!(cache.try_get("/a").is_none());
+        assert!(cache.try_get("/b").is_some());
+    }
+
+    #[test]
+    fn test_invalidate_prefix() {
+        let cache = SsrCache::new(100);
+
+        cache.insert("/products/1", Arc::from("p1"));
+        cache.insert("/products/2", Arc::from("p2"));
+        cache.insert("/about", Arc::from("about"));
+
+        let removed = cache.invalidate_prefix("/products");
+        assert_eq!(removed, 2);
+
+        assert!(cache.try_get("/products/1").is_none());
+        assert!(cache.try_get("/products/2").is_none());
+        assert!(cache.try_get("/about").is_some());
     }
 
     #[test]

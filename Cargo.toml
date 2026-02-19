@@ -19,6 +19,10 @@ path = "src/lib.rs"
 name = "basic"
 path = "examples/basic.rs"
 
+[[example]]
+name = "loadtest"
+path = "examples/loadtest.rs"
+
 # Optimizations for production
 [profile.release]
 opt-level = 3
@@ -31,12 +35,12 @@ default = ["v8-pool", "cache", "axum-integration"]
 v8-pool = ["deno_core", "serde_v8"]
 cache = ["dashmap", "parking_lot", "lru"]
 axum-integration = ["axum", "tower", "tower-http"]
-brotli-compression = ["brotli"]
+brotli-compression = ["brotli", "tokio/fs"]
 full = ["v8-pool", "cache", "axum-integration", "brotli-compression"]
 
 [dependencies]
-# Core async runtime
-tokio = { version = "1", features = ["full"] }
+# Core async runtime (minimal: sync for oneshot, rt for yield_now)
+tokio = { version = "1", features = ["rt", "sync"] }
 futures = "0.3"
 
 # Serialization

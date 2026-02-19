@@ -19,6 +19,11 @@ pub fn render_html(
 ) -> Result<String, String> {
     let data = data.unwrap_or("{}");
 
+    // Validate data is valid JSON to prevent code injection.
+    // Raw interpolation of untrusted strings into JS would allow arbitrary execution.
+    let safe_data: serde_json::Value = serde_json::from_str(data)
+        .map_err(|e| format!("Invalid JSON data: {}", e))?;
+
     // Escape URL for JavaScript string
     let escaped_url = url.replace('\\', "\\\\").replace('"', "\\\"");
 
@@ -38,7 +43,7 @@ pub fn render_html(
         "#,
         fn = render_function,
         url = escaped_url,
-        data = data
+        data = safe_data
     );
 
     // Execute the JS code

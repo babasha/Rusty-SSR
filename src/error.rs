@@ -62,9 +62,3 @@ impl From<std::io::Error> for SsrError {
         SsrError::Io(err)
     }
 }
-
-impl From<String> for SsrError {
-    fn from(msg: String) -> Self {
-        SsrError::JsExecution(msg)
-    }
-}

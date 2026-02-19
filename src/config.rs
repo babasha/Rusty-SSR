@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::error::{SsrError, SsrResult};
+
 /// Configuration for the SSR engine
 #[derive(Debug, Clone)]
 pub struct SsrConfig {
@@ -153,10 +155,17 @@ impl SsrConfigBuilder {
     }
 
     /// Build the configuration
-    pub fn build(self) -> SsrConfig {
+    ///
+    /// # Errors
+    /// Returns `SsrError::Config` if any parameter is invalid:
+    /// - `pool_size` must be > 0
+    /// - `cache_size` must be > 0
+    /// - `queue_capacity` must be > 0
+    /// - `render_function` must be a valid JS identifier (alphanumeric, `_`, `.`)
+    pub fn build(self) -> SsrResult<SsrConfig> {
         let default = SsrConfig::default();
 
-        SsrConfig {
+        let config = SsrConfig {
             bundle_path: self.bundle_path.unwrap_or(default.bundle_path),
             pool_size: self.pool_size.unwrap_or(default.pool_size),
             queue_capacity: self.queue_capacity.unwrap_or(default.queue_capacity),
@@ -165,7 +174,30 @@ impl SsrConfigBuilder {
             cache_ttl: self.cache_ttl.unwrap_or(default.cache_ttl),
             request_timeout: self.request_timeout.unwrap_or(default.request_timeout),
             render_function: self.render_function.unwrap_or(default.render_function),
+        };
+
+        if config.pool_size == 0 {
+            return Err(SsrError::Config("pool_size must be > 0".into()));
         }
+        if config.cache_size == 0 {
+            return Err(SsrError::Config("cache_size must be > 0".into()));
+        }
+        if config.queue_capacity == 0 {
+            return Err(SsrError::Config("queue_capacity must be > 0".into()));
+        }
+        if config.render_function.is_empty()
+            || !config
+                .render_function
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        {
+            return Err(SsrError::Config(format!(
+                "render_function must be a valid JS identifier, got: {:?}",
+                config.render_function
+            )));
+        }
+
+        Ok(config)
     }
 }
 
@@ -188,11 +220,47 @@ mod tests {
             .pool_size(4)
             .cache_size(100)
             .pin_threads(true)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.bundle_path, PathBuf::from("custom.js"));
         assert_eq!(config.pool_size, 4);
         assert_eq!(config.cache_size, 100);
         assert!(config.pin_threads);
+    }
+
+    #[test]
+    fn test_zero_pool_size_rejected() {
+        let result = SsrConfig::builder().pool_size(0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_cache_size_rejected() {
+        let result = SsrConfig::builder().cache_size(0).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_render_function_rejected() {
+        let result = SsrConfig::builder().render_function("").build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_render_function_rejected() {
+        let result = SsrConfig::builder()
+            .render_function("foo; evil()")
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dotted_render_function_ok() {
+        let config = SsrConfig::builder()
+            .render_function("module.renderPage")
+            .build()
+            .unwrap();
+        assert_eq!(config.render_function, "module.renderPage");
     }
 }

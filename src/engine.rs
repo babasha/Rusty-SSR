@@ -171,6 +171,26 @@ impl SsrEngine {
         self.render_uncached(url, &data.to_string()).await
     }
 
+    /// Invalidate a single cached URL
+    ///
+    /// Use after content updates for a specific page.
+    #[cfg(feature = "cache")]
+    pub fn invalidate(&self, url: &str) {
+        self.cache.invalidate(url);
+        tracing::debug!("Cache invalidated: {}", url);
+    }
+
+    /// Invalidate all cached URLs matching a prefix
+    ///
+    /// Example: `engine.invalidate_prefix("/products")` clears all product pages.
+    /// Returns the number of removed entries.
+    #[cfg(feature = "cache")]
+    pub fn invalidate_prefix(&self, prefix: &str) -> usize {
+        let removed = self.cache.invalidate_prefix(prefix);
+        tracing::info!("Cache invalidated {} entries with prefix: {}", removed, prefix);
+        removed
+    }
+
     /// Clear the SSR cache
     #[cfg(feature = "cache")]
     pub fn clear_cache(&self) {
@@ -212,7 +232,7 @@ impl SsrEngine {
 impl SsrConfigBuilder {
     /// Build the configuration and create an SsrEngine
     pub fn build_engine(self) -> SsrResult<SsrEngine> {
-        SsrEngine::new(self.build())
+        SsrEngine::new(self.build()?)
     }
 }
 
