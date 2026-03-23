@@ -29,6 +29,9 @@ pub enum SsrError {
     /// Configuration error
     Config(String),
 
+    /// HTML template error
+    Template(String),
+
     /// IO error
     Io(std::io::Error),
 }
@@ -42,6 +45,7 @@ impl fmt::Display for SsrError {
             SsrError::Timeout => write!(f, "Render timeout"),
             SsrError::Cache(msg) => write!(f, "Cache error: {}", msg),
             SsrError::PoolFull => write!(f, "V8 pool is full, request rejected"),
+            SsrError::Template(msg) => write!(f, "Template error: {}", msg),
             SsrError::Config(msg) => write!(f, "Configuration error: {}", msg),
             SsrError::Io(err) => write!(f, "IO error: {}", err),
         }

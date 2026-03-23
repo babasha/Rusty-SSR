@@ -11,9 +11,130 @@ use crate::v8_pool::{PoolError, V8Pool};
 #[cfg(feature = "cache")]
 use crate::cache::SsrCache;
 
+// ── HTML Template System ─────────────────────────────────────────────────────
+
+/// Parsed Vite manifest entry
+#[derive(Debug)]
+struct ManifestEntry {
+    file: String,
+    css: Vec<String>,
+}
+
+/// Pre-loaded HTML template with asset tags injected
+#[derive(Debug, Clone)]
+struct HtmlTemplate {
+    /// Template string with `<!--ssr:outlet-->` still present (replaced per-request)
+    content: String,
+}
+
+impl HtmlTemplate {
+    /// Load template from file, parse manifest, and inject asset tags
+    fn load(config: &SsrConfig) -> SsrResult<Option<Self>> {
+        let template_path = match &config.html_template_path {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        tracing::info!("📄 Loading HTML template from {:?}", template_path);
+
+        let mut content = std::fs::read_to_string(template_path).map_err(|e| {
+            SsrError::Template(format!(
+                "Failed to read HTML template {:?}: {}",
+                template_path, e
+            ))
+        })?;
+
+        if !content.contains("<!--ssr:outlet-->") {
+            return Err(SsrError::Template(
+                "HTML template must contain <!--ssr:outlet--> placeholder".into(),
+            ));
+        }
+
+        // Parse Vite manifest and inject asset tags
+        if let Some(manifest_path) = &config.assets_manifest_path {
+            let entry = Self::parse_manifest(manifest_path)?;
+
+            // Build CSS link tags
+            let css_tags: String = entry
+                .css
+                .iter()
+                .map(|p| format!(r#"<link rel="stylesheet" href="/{}" />"#, p))
+                .collect::<Vec<_>>()
+                .join("\n    ");
+
+            // Build script tag
+            let script_tag = format!(r#"<script type="module" src="/{}"></script>"#, entry.file);
+
+            content = content.replace("<!--ssr:css-->", &css_tags);
+            content = content.replace("<!--ssr:scripts-->", &script_tag);
+
+            tracing::info!(
+                "✅ Manifest parsed: JS={}, CSS files={}",
+                entry.file,
+                entry.css.len()
+            );
+        }
+
+        // Replace ssr:head with empty (reserved for future use)
+        content = content.replace("<!--ssr:head-->", "");
+
+        Ok(Some(HtmlTemplate { content }))
+    }
+
+    /// Parse Vite manifest.json and find the entry chunk
+    fn parse_manifest(path: &std::path::Path) -> SsrResult<ManifestEntry> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            SsrError::Template(format!("Failed to read manifest {:?}: {}", path, e))
+        })?;
+
+        let manifest: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            SsrError::Template(format!("Failed to parse manifest JSON: {}", e))
+        })?;
+
+        let obj = manifest
+            .as_object()
+            .ok_or_else(|| SsrError::Template("Manifest is not a JSON object".into()))?;
+
+        // Find entry with isEntry: true, or fall back to first entry
+        let entry_value = obj
+            .values()
+            .find(|v| v.get("isEntry").and_then(|e| e.as_bool()).unwrap_or(false))
+            .or_else(|| obj.values().next())
+            .ok_or_else(|| SsrError::Template("Manifest has no entries".into()))?;
+
+        let file = entry_value
+            .get("file")
+            .and_then(|f| f.as_str())
+            .ok_or_else(|| SsrError::Template("Manifest entry missing 'file' field".into()))?
+            .to_string();
+
+        let css = entry_value
+            .get("css")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(ManifestEntry { file, css })
+    }
+
+    /// Inject rendered HTML fragment into the template
+    fn inject(&self, fragment: &str) -> String {
+        self.content.replace("<!--ssr:outlet-->", fragment)
+    }
+}
+
+// ── SSR Engine ───────────────────────────────────────────────────────────────
+
 /// The main SSR engine that coordinates V8 pool and caching
 pub struct SsrEngine {
     config: SsrConfig,
+
+    /// Pre-loaded HTML template (None = return raw fragments)
+    template: Option<HtmlTemplate>,
 
     #[cfg(feature = "v8-pool")]
     v8_pool: V8Pool,
@@ -47,6 +168,12 @@ impl SsrEngine {
             config.cache_size
         );
 
+        // Load HTML template + manifest (if configured)
+        let template = HtmlTemplate::load(&config)?;
+        if template.is_some() {
+            tracing::info!("📄 HTML template system enabled");
+        }
+
         #[cfg(feature = "v8-pool")]
         let v8_pool = {
             // Initialize the V8 bundle
@@ -69,6 +196,7 @@ impl SsrEngine {
 
         Ok(Self {
             config,
+            template,
             #[cfg(feature = "v8-pool")]
             v8_pool,
             #[cfg(feature = "cache")]
@@ -150,6 +278,42 @@ impl SsrEngine {
     ) -> SsrResult<Arc<str>> {
         let data_str = data.to_string();
         self.render_with_data(url, &data_str).await
+    }
+
+    /// Render a URL and inject result into the HTML template
+    ///
+    /// If no template is configured, behaves identically to `render()`.
+    /// When a template is set, the V8-rendered fragment is injected into
+    /// `<!--ssr:outlet-->` and a complete HTML document is returned.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # async fn example(engine: SsrEngine) {
+    /// // Returns complete HTML document if template is configured
+    /// let html = engine.render_to_html("/home").await.unwrap();
+    /// // html = "<!doctype html><html>...<div id='root'>...app...</div>...</html>"
+    /// # }
+    /// ```
+    #[cfg(all(feature = "v8-pool", feature = "cache"))]
+    pub async fn render_to_html(&self, url: &str) -> SsrResult<String> {
+        self.render_to_html_with_data(url, "{}").await
+    }
+
+    /// Render a URL with data and inject into the HTML template
+    #[cfg(all(feature = "v8-pool", feature = "cache"))]
+    pub async fn render_to_html_with_data(&self, url: &str, data: &str) -> SsrResult<String> {
+        let fragment = self.render_with_data(url, data).await?;
+
+        match &self.template {
+            Some(tmpl) => Ok(tmpl.inject(&fragment)),
+            None => Ok(fragment.to_string()),
+        }
+    }
+
+    /// Check if the HTML template system is enabled
+    pub fn has_template(&self) -> bool {
+        self.template.is_some()
     }
 
     /// Render without caching (always hits V8)

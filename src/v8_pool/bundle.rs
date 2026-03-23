@@ -15,9 +15,30 @@ const BROWSER_POLYFILLS: &str = r#"
 // Rusty-SSR Browser Polyfills
 // =========================================
 
+// SSR detection flag
+globalThis.__SSR__ = true;
+
 // Basic globals
 globalThis.window = globalThis;
 globalThis.self = globalThis;
+
+// --- Platform stubs (Tauri, Electron, Capacitor) ---
+// Tauri IPC — prevents crash when @tauri-apps/api is bundled
+globalThis.__TAURI_IPC__ = function() {};
+globalThis.__TAURI_INTERNALS__ = {
+    invoke: function() { return Promise.reject(new Error('Tauri IPC not available in SSR')); },
+    transformCallback: function() { return 0; },
+    convertFileSrc: function(s) { return s; },
+    metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } }
+};
+
+// Electron stubs
+if (!globalThis.process) {
+    globalThis.process = { env: { NODE_ENV: 'production' }, platform: 'linux', versions: {} };
+}
+
+// Capacitor stub
+globalThis.Capacitor = globalThis.Capacitor || { isNativePlatform: function() { return false; } };
 
 // Minimal timers (no real scheduling; executes immediately)
 let __rustyTimerId = 0;
@@ -36,31 +57,100 @@ globalThis.clearInterval = () => {};
 
 // Document mock
 globalThis.document = {
-    createElement: (tag) => ({
-        tagName: tag.toUpperCase(),
-        style: {},
-        setAttribute: () => {},
-        getAttribute: () => null,
-        appendChild: () => {},
-        removeChild: () => {},
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        classList: {
-            add: () => {},
-            remove: () => {},
-            toggle: () => {},
-            contains: () => false
+    createElement: function(tag) {
+        var el = {
+            tagName: tag.toUpperCase(),
+            style: {},
+            className: '',
+            id: '',
+            innerHTML: '',
+            textContent: '',
+            children: [],
+            childNodes: [],
+            parentNode: null,
+            dataset: {},
+            // Attributes
+            setAttribute: function(k, v) { el[k] = v; },
+            getAttribute: function(k) { return el[k] !== undefined ? String(el[k]) : null; },
+            removeAttribute: function() {},
+            hasAttribute: function(k) { return el[k] !== undefined; },
+            // DOM tree
+            appendChild: function(child) { el.children.push(child); child.parentNode = el; return child; },
+            removeChild: function(child) { return child; },
+            insertBefore: function(child) { el.children.push(child); return child; },
+            replaceChild: function(n) { return n; },
+            cloneNode: function() { return globalThis.document.createElement(tag); },
+            // Events
+            addEventListener: function() {},
+            removeEventListener: function() {},
+            dispatchEvent: function() { return true; },
+            // Class list
+            classList: {
+                _c: [],
+                add: function() {},
+                remove: function() {},
+                toggle: function() {},
+                contains: function() { return false; },
+                replace: function() {}
+            },
+            // CSS — for <style> elements and CSS-in-JS
+            sheet: (tag === 'style') ? {
+                cssRules: [],
+                insertRule: function() { return 0; },
+                deleteRule: function() {},
+                replaceSync: function() {}
+            } : undefined,
+            // Link/script attributes
+            rel: '', href: '', src: '', type: '', media: '', crossOrigin: '',
+            onload: null, onerror: null,
+            // Dimensions (always zero in SSR)
+            offsetWidth: 0, offsetHeight: 0,
+            getBoundingClientRect: function() {
+                return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+            }
+        };
+        // Simulate async load for link/script elements
+        if (tag === 'link' || tag === 'script') {
+            setTimeout(function() { if (el.onload) el.onload(); }, 0);
         }
-    }),
-    createTextNode: (text) => ({ textContent: text }),
-    getElementById: () => null,
-    querySelector: () => null,
-    querySelectorAll: () => [],
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    documentElement: { style: {} },
-    head: { appendChild: () => {} },
-    body: { appendChild: () => {} }
+        return el;
+    },
+    createTextNode: function(text) { return { textContent: text, nodeType: 3 }; },
+    createDocumentFragment: function() {
+        return { children: [], appendChild: function(c) { this.children.push(c); return c; } };
+    },
+    createComment: function(text) { return { textContent: text, nodeType: 8 }; },
+    getElementById: function() { return null; },
+    querySelector: function() { return null; },
+    querySelectorAll: function() { return []; },
+    getElementsByTagName: function() { return []; },
+    getElementsByClassName: function() { return []; },
+    addEventListener: function() {},
+    removeEventListener: function() {},
+    createEvent: function() {
+        return { initEvent: function() {} };
+    },
+    documentElement: {
+        style: {},
+        setAttribute: function() {},
+        getAttribute: function() { return null; },
+        classList: { add: function(){}, remove: function(){}, contains: function(){ return false; } }
+    },
+    head: {
+        appendChild: function(c) { return c; },
+        insertBefore: function(c) { return c; },
+        querySelector: function() { return null; },
+        querySelectorAll: function() { return []; }
+    },
+    body: {
+        appendChild: function(c) { return c; },
+        insertBefore: function(c) { return c; },
+        querySelector: function() { return null; },
+        querySelectorAll: function() { return []; }
+    },
+    cookie: '',
+    readyState: 'complete',
+    title: ''
 };
 
 // Navigator mock

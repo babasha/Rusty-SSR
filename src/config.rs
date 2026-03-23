@@ -31,6 +31,22 @@ pub struct SsrConfig {
 
     /// Name of the global render function in JS bundle
     pub render_function: String,
+
+    /// Path to an HTML template with SSR placeholders (optional)
+    ///
+    /// When set, the engine injects rendered HTML into the template
+    /// instead of returning raw fragments. Supported placeholders:
+    /// - `<!--ssr:outlet-->` — rendered app HTML
+    /// - `<!--ssr:css-->`    — `<link>` tags from Vite manifest
+    /// - `<!--ssr:scripts-->` — `<script>` tags from Vite manifest
+    /// - `<!--ssr:head-->`   — extra head content (reserved)
+    pub html_template_path: Option<PathBuf>,
+
+    /// Path to Vite manifest.json for hashed asset paths (optional)
+    ///
+    /// Used together with `html_template_path` to inject correct
+    /// `<link>` and `<script>` tags with content-hashed filenames.
+    pub assets_manifest_path: Option<PathBuf>,
 }
 
 impl Default for SsrConfig {
@@ -44,6 +60,8 @@ impl Default for SsrConfig {
             cache_ttl: Some(Duration::from_secs(300)), // 5 minutes
             request_timeout: Some(Duration::from_secs(30)),
             render_function: "renderPage".to_string(),
+            html_template_path: None,
+            assets_manifest_path: None,
         }
     }
 }
@@ -66,6 +84,8 @@ pub struct SsrConfigBuilder {
     cache_ttl: Option<Option<Duration>>,
     request_timeout: Option<Option<Duration>>,
     render_function: Option<String>,
+    html_template_path: Option<PathBuf>,
+    assets_manifest_path: Option<PathBuf>,
 }
 
 impl SsrConfigBuilder {
@@ -144,6 +164,35 @@ impl SsrConfigBuilder {
         self
     }
 
+    /// Set the HTML template path for SSR output
+    ///
+    /// The template should contain `<!--ssr:outlet-->` where the rendered
+    /// app HTML will be injected. Optionally use `<!--ssr:css-->` and
+    /// `<!--ssr:scripts-->` for Vite manifest-based asset injection.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rusty_ssr::SsrConfig;
+    ///
+    /// let config = SsrConfig::builder()
+    ///     .bundle_path("dist-ssr/bundle.js")
+    ///     .html_template("dist-web/index.html")
+    ///     .assets_manifest("dist-web/.vite/manifest.json")
+    ///     .build();
+    /// ```
+    pub fn html_template<P: Into<PathBuf>>(mut self, path: P) -> Self {
+        self.html_template_path = Some(path.into());
+        self
+    }
+
+    /// Set the Vite manifest.json path for asset resolution
+    ///
+    /// Used with `html_template` to inject hashed CSS and JS paths.
+    pub fn assets_manifest<P: Into<PathBuf>>(mut self, path: P) -> Self {
+        self.assets_manifest_path = Some(path.into());
+        self
+    }
+
     /// Set the name of the global render function
     ///
     /// Default: "renderPage"
@@ -174,6 +223,8 @@ impl SsrConfigBuilder {
             cache_ttl: self.cache_ttl.unwrap_or(default.cache_ttl),
             request_timeout: self.request_timeout.unwrap_or(default.request_timeout),
             render_function: self.render_function.unwrap_or(default.render_function),
+            html_template_path: self.html_template_path,
+            assets_manifest_path: self.assets_manifest_path,
         };
 
         if config.pool_size == 0 {
