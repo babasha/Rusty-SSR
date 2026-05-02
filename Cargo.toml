@@ -13,7 +13,7 @@ repository = "https://github.com/babasha/Rusty-SSR"
 homepage = "https://github.com/babasha/Rusty-SSR"
 documentation = "https://docs.rs/rusty-ssr"
 readme = "README.md"
-keywords = ["ssr", "v8", "preact", "react", "server-side-rendering"]
+keywords = ["ssr", "v8", "preact", "react", "rendering"]
 categories = ["web-programming", "caching", "asynchronous"]
 
 [lib]
