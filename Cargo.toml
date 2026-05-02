@@ -1,3 +1,7 @@
+# Standalone package — explicitly opts out of any enclosing workspace
+# (the folder may sit inside an unrelated cargo workspace on disk).
+[workspace]
+
 [package]
 name = "rusty-ssr"
 version = "0.1.0"
