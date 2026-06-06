@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
@@ -44,8 +44,8 @@ brotli-compression = ["brotli", "tokio/fs"]
 full = ["v8-pool", "cache", "axum-integration", "brotli-compression"]
 
 [dependencies]
-# Core async runtime (minimal: sync for oneshot, rt for yield_now)
-tokio = { version = "1", features = ["rt", "sync"] }
+# Core async runtime (sync for oneshot, rt for yield_now, time for render timeout)
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 futures = "0.3"
 
 # Serialization

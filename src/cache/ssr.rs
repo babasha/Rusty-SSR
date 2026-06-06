@@ -111,14 +111,14 @@ impl SsrCache {
     ///
     /// Checks hot cache first, then cold cache.
     /// Cold hits are promoted to hot cache.
-    pub fn try_get(&self, url: &str) -> Option<Arc<str>> {
-        let url_hash = hash_url(url);
+    pub fn try_get(&self, key: &str) -> Option<Arc<str>> {
+        let key_hash = hash_url(key);
         let start = Instant::now();
         self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
 
         // 1. Check hot cache (L1/L2) - use peek() for read-only access
         let hot = self.get_or_init_hot_cache();
-        if let Some(html) = hot.borrow().cache.peek(url_hash) {
+        if let Some(html) = hot.borrow().cache.peek(key_hash, key) {
             self.metrics.hot_hits.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .last_access_ns
@@ -127,12 +127,12 @@ impl SsrCache {
         }
 
         // 2. Check cold cache (RAM)
-        if let Some(html) = self.cold_cache.get(url_hash) {
+        if let Some(html) = self.cold_cache.get(key_hash, key) {
             self.metrics.cold_hits.fetch_add(1, Ordering::Relaxed);
 
             // Promote to hot cache
             let mut hot_ref = hot.borrow_mut();
-            hot_ref.cache.insert(url_hash, Arc::clone(&html));
+            hot_ref.cache.insert(key_hash, Arc::from(key), Arc::clone(&html));
             self.metrics.promotions.fetch_add(1, Ordering::Relaxed);
 
             self.metrics
@@ -146,11 +146,15 @@ impl SsrCache {
     }
 
     /// Insert HTML into cache
-    pub fn insert(&self, url: &str, html: Arc<str>) {
-        let url_hash = hash_url(url);
+    pub fn insert(&self, key: &str, html: Arc<str>) {
+        let key_hash = hash_url(key);
+        // Allocate the key once and share it between the cold and hot tiers.
+        let key_arc: Arc<str> = Arc::from(key);
 
         // Insert into cold cache
-        let evicted = self.cold_cache.insert(url_hash, url, Arc::clone(&html));
+        let evicted = self
+            .cold_cache
+            .insert(key_hash, Arc::clone(&key_arc), Arc::clone(&html));
         self.metrics.insertions.fetch_add(1, Ordering::Relaxed);
         if evicted > 0 {
             self.metrics.evictions.fetch_add(evicted as u64, Ordering::Relaxed);
@@ -159,16 +163,16 @@ impl SsrCache {
         // Insert into hot cache
         let hot = self.get_or_init_hot_cache();
         let mut hot_ref = hot.borrow_mut();
-        hot_ref.cache.insert(url_hash, html);
+        hot_ref.cache.insert(key_hash, key_arc, html);
     }
 
     /// Invalidate a single cached URL
     ///
     /// Removes from cold cache and bumps generation to clear hot caches.
     /// Other hot-cached entries will be re-promoted from cold on next access.
-    pub fn invalidate(&self, url: &str) {
-        let url_hash = hash_url(url);
-        if self.cold_cache.remove(url_hash) {
+    pub fn invalidate(&self, key: &str) {
+        let key_hash = hash_url(key);
+        if self.cold_cache.remove(key_hash, key) {
             self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }

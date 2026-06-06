@@ -1,19 +1,21 @@
 //! Thread-local "hot" cache optimized for L1/L2 CPU cache
 //!
 //! Two-tier design:
-//! - Ultra-hot: 8 entries in cache-line aligned array (~1-3ns access)
-//! - Hot: HashMap for O(1) lookup on more entries (~5-10ns access)
+//! - Ultra-hot: 8 entries in a cache-line aligned array (~1-3ns access)
+//! - Hot: a proper LRU map for O(1) lookup on more entries (~5-10ns access)
 //!
-//! Total capacity: 128 entries per thread
+//! Total capacity: 8 + 128 entries per thread. A key lives in exactly one tier
+//! at a time (insert de-duplicates), so accounting never drifts.
 
-use std::collections::HashMap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Maximum entries in ultra-hot array (fits in 2 cache lines)
 const ULTRA_HOT_SIZE: usize = 8;
 
-/// Maximum entries in hot HashMap
+/// Maximum entries in the LRU tier
 const HOT_MAP_CAPACITY: usize = 128;
 
 /// Thread-local hot cache with two tiers
@@ -21,15 +23,12 @@ const HOT_MAP_CAPACITY: usize = 128;
 /// Uses `#[repr(align(64))]` to prevent false sharing between threads.
 #[repr(align(64))]
 pub struct HotCache {
-    // Tier 1: Ultra-hot array for most recent entries
+    // Tier 1: Ultra-hot ring buffer for the most recently inserted entries.
     ultra_hot: [Option<HotEntry>; ULTRA_HOT_SIZE],
     ultra_hot_next: usize,
 
-    // Tier 2: HashMap for O(1) lookup on more entries
-    hot_map: HashMap<u64, HotEntry>,
-
-    // LRU tracking for hot_map eviction
-    access_order: Vec<u64>,
+    // Tier 2: true LRU map (least-recently-used evicted) for the larger set.
+    lru: LruCache<u64, HotEntry>,
 
     ttl: Option<Duration>,
 }
@@ -37,6 +36,9 @@ pub struct HotCache {
 #[derive(Clone)]
 struct HotEntry {
     url_hash: u64,
+    /// Full cache key, compared on lookup so a hash collision misses rather
+    /// than returning another key's content.
+    key: Arc<str>,
     html: Arc<str>,
     created_at: Instant,
 }
@@ -44,13 +46,7 @@ struct HotEntry {
 impl HotCache {
     /// Create a new empty hot cache
     pub fn new() -> Self {
-        Self {
-            ultra_hot: Default::default(),
-            ultra_hot_next: 0,
-            hot_map: HashMap::with_capacity(HOT_MAP_CAPACITY),
-            access_order: Vec::with_capacity(HOT_MAP_CAPACITY),
-            ttl: None,
-        }
+        Self::with_ttl(0)
     }
 
     /// Create a hot cache with TTL
@@ -58,8 +54,7 @@ impl HotCache {
         Self {
             ultra_hot: Default::default(),
             ultra_hot_next: 0,
-            hot_map: HashMap::with_capacity(HOT_MAP_CAPACITY),
-            access_order: Vec::with_capacity(HOT_MAP_CAPACITY),
+            lru: LruCache::new(NonZeroUsize::new(HOT_MAP_CAPACITY).expect("capacity > 0")),
             ttl: if ttl_secs > 0 {
                 Some(Duration::from_secs(ttl_secs))
             } else {
@@ -68,122 +63,115 @@ impl HotCache {
         }
     }
 
-    /// Look up HTML by URL hash
+    /// Look up HTML by key hash, verifying the full key
     ///
-    /// Checks ultra-hot array first (fastest), then HashMap
+    /// Checks ultra-hot array first (fastest), then the LRU map. The `key` is
+    /// compared after the hash matches, so a 64-bit collision misses rather
+    /// than returning another key's content. A hit in the LRU tier is promoted
+    /// to ultra-hot.
     #[inline(always)]
-    pub fn get(&mut self, url_hash: u64) -> Option<Arc<str>> {
-        // Tier 1: Check ultra-hot array first (linear scan, but only 8 entries)
+    pub fn get(&mut self, url_hash: u64, key: &str) -> Option<Arc<str>> {
+        let ttl = self.ttl;
+
+        // Tier 1: ultra-hot linear scan (only 8 entries).
         for entry in self.ultra_hot.iter().flatten() {
-            if entry.url_hash == url_hash {
-                if self.is_expired(entry) {
-                    return None;
+            if entry.url_hash == url_hash && entry.key.as_ref() == key {
+                return if Self::expired(ttl, entry) {
+                    None
+                } else {
+                    Some(Arc::clone(&entry.html))
+                };
+            }
+        }
+
+        // Tier 2: LRU map. Read without mutating order first, then act.
+        let hit = match self.lru.peek(&url_hash) {
+            Some(e) if e.key.as_ref() == key && !Self::expired(ttl, e) => {
+                Some((Arc::clone(&e.html), Arc::clone(&e.key)))
+            }
+            _ => None,
+        };
+
+        match hit {
+            Some((html, key_arc)) => {
+                // Promote to ultra-hot (insert de-duplicates from the LRU tier).
+                self.insert(url_hash, key_arc, Arc::clone(&html));
+                Some(html)
+            }
+            None => {
+                // Drop a stale/expired entry for this exact key if present.
+                if matches!(self.lru.peek(&url_hash), Some(e) if e.key.as_ref() == key) {
+                    self.lru.pop(&url_hash);
                 }
-                return Some(Arc::clone(&entry.html));
+                None
             }
         }
-
-        // Tier 2: Check HashMap (O(1) lookup)
-        if let Some(entry) = self.hot_map.get(&url_hash) {
-            if self.is_expired(entry) {
-                self.hot_map.remove(&url_hash);
-                return None;
-            }
-
-            // Promote to ultra-hot on access (LRU behavior)
-            let html = Arc::clone(&entry.html);
-            self.promote_to_ultra_hot(url_hash, Arc::clone(&html));
-            return Some(html);
-        }
-
-        None
     }
 
     /// Look up without promotion (for read-only access)
     #[inline(always)]
-    pub fn peek(&self, url_hash: u64) -> Option<Arc<str>> {
-        // Check ultra-hot first
+    pub fn peek(&self, url_hash: u64, key: &str) -> Option<Arc<str>> {
+        let ttl = self.ttl;
+
         for entry in self.ultra_hot.iter().flatten() {
-            if entry.url_hash == url_hash {
-                if self.is_expired(entry) {
-                    return None;
-                }
-                return Some(Arc::clone(&entry.html));
+            if entry.url_hash == url_hash && entry.key.as_ref() == key {
+                return if Self::expired(ttl, entry) {
+                    None
+                } else {
+                    Some(Arc::clone(&entry.html))
+                };
             }
         }
 
-        // Check HashMap
-        if let Some(entry) = self.hot_map.get(&url_hash) {
-            if self.is_expired(entry) {
-                return None;
-            }
-            return Some(Arc::clone(&entry.html));
+        match self.lru.peek(&url_hash) {
+            Some(e) if e.key.as_ref() == key && !Self::expired(ttl, e) => Some(Arc::clone(&e.html)),
+            _ => None,
         }
-
-        None
     }
 
     /// Insert a new entry
+    ///
+    /// De-duplicates by hash across both tiers first, so a key is never present
+    /// in more than one place (no stale duplicates, no accounting drift).
     #[inline(always)]
-    pub fn insert(&mut self, url_hash: u64, html: Arc<str>) {
+    pub fn insert(&mut self, url_hash: u64, key: Arc<str>, html: Arc<str>) {
+        // Remove any existing copy of this hash from both tiers.
+        for slot in self.ultra_hot.iter_mut() {
+            if slot.as_ref().is_some_and(|e| e.url_hash == url_hash) {
+                *slot = None;
+            }
+        }
+        self.lru.pop(&url_hash);
+
         let entry = HotEntry {
             url_hash,
+            key,
             html,
             created_at: Instant::now(),
         };
 
-        // Always insert into ultra-hot first
-        // Evicted entry goes to hot_map
+        // Place into the ultra-hot ring; demote the slot's previous occupant to
+        // the LRU tier (its hash differs from ours — we just cleared ours).
         if let Some(evicted) = self.ultra_hot[self.ultra_hot_next].take() {
-            // Move evicted to hot_map
-            self.insert_to_hot_map(evicted);
+            self.lru.put(evicted.url_hash, evicted);
         }
-
         self.ultra_hot[self.ultra_hot_next] = Some(entry);
         self.ultra_hot_next = (self.ultra_hot_next + 1) % ULTRA_HOT_SIZE;
     }
 
-    /// Insert into hot_map with LRU eviction
-    fn insert_to_hot_map(&mut self, entry: HotEntry) {
-        // Evict oldest if at capacity
-        if self.hot_map.len() >= HOT_MAP_CAPACITY {
-            if let Some(oldest_key) = self.access_order.first().copied() {
-                self.hot_map.remove(&oldest_key);
-                self.access_order.remove(0);
-            }
-        }
-
-        self.access_order.push(entry.url_hash);
-        self.hot_map.insert(entry.url_hash, entry);
-    }
-
-    /// Promote an entry from hot_map to ultra-hot
-    fn promote_to_ultra_hot(&mut self, url_hash: u64, html: Arc<str>) {
-        // Remove from hot_map
-        self.hot_map.remove(&url_hash);
-        if let Some(pos) = self.access_order.iter().position(|&k| k == url_hash) {
-            self.access_order.remove(pos);
-        }
-
-        // Insert into ultra-hot (this will move current ultra-hot entry to hot_map)
-        self.insert(url_hash, html);
-    }
-
     /// Check if entry is expired
     #[inline(always)]
-    fn is_expired(&self, entry: &HotEntry) -> bool {
-        if let Some(ttl) = self.ttl {
-            entry.created_at.elapsed() > ttl
-        } else {
-            false
+    fn expired(ttl: Option<Duration>, entry: &HotEntry) -> bool {
+        match ttl {
+            Some(t) => entry.created_at.elapsed() > t,
+            None => false,
         }
     }
 
     /// Get total number of cached entries
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        let ultra_hot_count = self.ultra_hot.iter().flatten().count();
-        ultra_hot_count + self.hot_map.len()
+        self.ultra_hot.iter().flatten().count() + self.lru.len()
     }
 
     /// Check if cache is empty
@@ -197,8 +185,7 @@ impl HotCache {
     pub fn clear(&mut self) {
         self.ultra_hot = Default::default();
         self.ultra_hot_next = 0;
-        self.hot_map.clear();
-        self.access_order.clear();
+        self.lru.clear();
     }
 }
 
@@ -212,15 +199,29 @@ impl Default for HotCache {
 mod tests {
     use super::*;
 
+    fn k(i: u64) -> Arc<str> {
+        Arc::from(format!("k{}", i))
+    }
+
     #[test]
     fn test_basic_operations() {
         let mut cache = HotCache::new();
         let html: Arc<str> = "test".into();
 
-        cache.insert(123, Arc::clone(&html));
+        cache.insert(123, k(123), Arc::clone(&html));
 
-        assert!(cache.get(123).is_some());
-        assert!(cache.get(456).is_none());
+        assert!(cache.get(123, "k123").is_some());
+        assert!(cache.get(456, "k456").is_none());
+    }
+
+    #[test]
+    fn test_get_rejects_hash_collision() {
+        let mut cache = HotCache::new();
+        cache.insert(7, Arc::from("/real"), "real".into());
+
+        // Same hash, different key → miss, not the wrong content.
+        assert!(cache.peek(7, "/attacker").is_none());
+        assert!(cache.peek(7, "/real").is_some());
     }
 
     #[test]
@@ -230,14 +231,13 @@ mod tests {
         // Insert more than 8 entries
         for i in 0..10u64 {
             let html: Arc<str> = format!("html{}", i).into();
-            cache.insert(i, html);
+            cache.insert(i, k(i), html);
         }
 
-        // First 2 should be in hot_map, not ultra_hot
-        // But still accessible via get()
-        assert!(cache.get(0).is_some(), "Entry 0 should be in hot_map");
-        assert!(cache.get(1).is_some(), "Entry 1 should be in hot_map");
-        assert!(cache.get(9).is_some(), "Entry 9 should be in ultra_hot");
+        // First 2 spilled to the LRU tier, but still accessible via get().
+        assert!(cache.get(0, "k0").is_some(), "Entry 0 should be in LRU tier");
+        assert!(cache.get(1, "k1").is_some(), "Entry 1 should be in LRU tier");
+        assert!(cache.get(9, "k9").is_some(), "Entry 9 should be in ultra_hot");
     }
 
     #[test]
@@ -246,20 +246,19 @@ mod tests {
 
         // Fill ultra_hot
         for i in 0..8u64 {
-            cache.insert(i, format!("html{}", i).into());
+            cache.insert(i, k(i), format!("html{}", i).into());
         }
 
-        // Add more to push to hot_map
+        // Add more to push to the LRU tier
         for i in 8..16u64 {
-            cache.insert(i, format!("html{}", i).into());
+            cache.insert(i, k(i), format!("html{}", i).into());
         }
 
-        // Entry 0 should be in hot_map now
-        // Accessing it should promote it back to ultra_hot
-        let _ = cache.get(0);
+        // Entry 0 is in the LRU tier now; accessing it promotes it to ultra_hot.
+        let _ = cache.get(0, "k0");
 
         // Verify it's accessible
-        assert!(cache.peek(0).is_some());
+        assert!(cache.peek(0, "k0").is_some());
     }
 
     #[test]
@@ -268,7 +267,7 @@ mod tests {
 
         // Insert 200 entries (more than 128 capacity)
         for i in 0..200u64 {
-            cache.insert(i, format!("html{}", i).into());
+            cache.insert(i, k(i), format!("html{}", i).into());
         }
 
         // Should have at most 128 + 8 = 136 entries
@@ -281,11 +280,36 @@ mod tests {
 
         // Fill with 100 entries
         for i in 0..100u64 {
-            cache.insert(i, format!("html{}", i).into());
+            cache.insert(i, k(i), format!("html{}", i).into());
         }
 
-        // Access entry that's definitely in hot_map
-        // This should be O(1), not O(n)
-        assert!(cache.peek(50).is_some());
+        // Access entry that's definitely in the LRU tier — O(1), not O(n).
+        assert!(cache.peek(50, "k50").is_some());
+    }
+
+    #[test]
+    fn test_reinsert_no_duplicate_drift() {
+        let mut cache = HotCache::new();
+
+        // Re-insert the same key many times: it must occupy exactly one slot,
+        // so len() stays 1 (the old hot_map+access_order design drifted here).
+        for _ in 0..50 {
+            cache.insert(42, k(42), "v".into());
+        }
+        assert_eq!(cache.len(), 1, "re-inserting one key must not create duplicates");
+        assert!(cache.peek(42, "k42").is_some());
+
+        // Re-inserting a key that has spilled to the LRU tier also stays unique.
+        for i in 0..20u64 {
+            cache.insert(i, k(i), "v".into());
+        }
+        let before = cache.len();
+        cache.insert(0, k(0), "v2".into()); // 0 likely in LRU tier by now
+        assert!(
+            cache.len() <= before,
+            "re-insert must not increase count (was {}, now {})",
+            before,
+            cache.len()
+        );
     }
 }

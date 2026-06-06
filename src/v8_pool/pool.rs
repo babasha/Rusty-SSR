@@ -1,14 +1,41 @@
 //! V8 Thread Pool implementation
 
 use core_affinity::CoreId;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use deno_core::v8::IsolateHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
 use super::{renderer, runtime};
+
+/// Per-worker termination state for the render watchdog.
+struct WorkerWatch {
+    /// Deadline of the in-flight render, as nanos since `Watchdog::start`;
+    /// 0 means the worker is idle.
+    deadline_nanos: AtomicU64,
+    /// The worker's isolate handle, set once after V8 init.
+    handle: OnceLock<IsolateHandle>,
+}
+
+/// Watchdog that terminates renders exceeding `request_timeout`, so a runaway
+/// (e.g. a non-allocating `while(true)`) frees its worker instead of wedging it
+/// permanently. Only created when `request_timeout` is set.
+struct Watchdog {
+    start: Instant,
+    timeout_nanos: u64,
+    slots: Vec<WorkerWatch>,
+    shutdown: AtomicBool,
+}
+
+impl Watchdog {
+    #[inline]
+    fn now(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+}
 
 /// Configuration for the V8 thread pool
 #[derive(Debug, Clone)]
@@ -22,11 +49,15 @@ pub struct V8PoolConfig {
     /// Pin workers to specific CPU cores
     pub pin_threads: bool,
 
-    /// Timeout for enqueueing render requests (None = block)
+    /// Timeout for the whole render request — enqueueing *and* waiting for the
+    /// worker's response (None = wait indefinitely).
     pub request_timeout: Option<Duration>,
 
     /// Name of the render function in JS
     pub render_function: String,
+
+    /// Maximum V8 heap size per isolate, in megabytes (None = unbounded)
+    pub max_heap_mb: Option<usize>,
 }
 
 impl Default for V8PoolConfig {
@@ -37,6 +68,7 @@ impl Default for V8PoolConfig {
             pin_threads: false,
             request_timeout: Some(Duration::from_secs(30)),
             render_function: "renderPage".to_string(),
+            max_heap_mb: None,
         }
     }
 }
@@ -100,6 +132,8 @@ pub struct V8Pool {
     core_affinity: Option<Arc<Vec<CoreId>>>,
     #[allow(dead_code)]
     next_core: Arc<AtomicUsize>,
+    /// Render watchdog (present when `request_timeout` is set).
+    watchdog: Option<Arc<Watchdog>>,
 }
 
 impl V8Pool {
@@ -117,6 +151,24 @@ impl V8Pool {
             None
         };
 
+        // Render watchdog — one deadline slot per worker. Only when a timeout
+        // is configured (no timeout = renders may run unbounded by request).
+        let watchdog = config.request_timeout.map(|t| {
+            let mut slots = Vec::with_capacity(config.num_threads);
+            for _ in 0..config.num_threads {
+                slots.push(WorkerWatch {
+                    deadline_nanos: AtomicU64::new(0),
+                    handle: OnceLock::new(),
+                });
+            }
+            Arc::new(Watchdog {
+                start: Instant::now(),
+                timeout_nanos: t.as_nanos() as u64,
+                slots,
+                shutdown: AtomicBool::new(false),
+            })
+        });
+
         let pool = Self {
             config: config.clone(),
             request_tx,
@@ -124,6 +176,7 @@ impl V8Pool {
             worker_count: Arc::clone(&worker_count),
             core_affinity: core_affinity.clone(),
             next_core: Arc::new(AtomicUsize::new(0)),
+            watchdog: watchdog.clone(),
         };
 
         // Spawn worker threads
@@ -134,7 +187,14 @@ impl V8Pool {
                 Arc::clone(&worker_count),
                 core_affinity.clone(),
                 Arc::clone(&pool.next_core),
+                config.max_heap_mb,
+                watchdog.clone(),
             );
+        }
+
+        // Spawn the watchdog thread.
+        if let Some(wd) = &watchdog {
+            spawn_watchdog(Arc::clone(wd));
         }
 
         tracing::info!("✅ Started {} V8 workers", config.num_threads);
@@ -180,10 +240,27 @@ impl V8Pool {
             }
         }
 
-        match response_rx.await {
-            Ok(Ok(html)) => Ok(html),
-            Ok(Err(msg)) => Err(PoolError::Render(msg)),
-            Err(_) => Err(PoolError::WorkerCrashed),
+        // Wait for the response, bounded by the same deadline that bounded
+        // enqueueing. Without this an infinite-loop render (or a request that
+        // was queued but never picked up) would hang the caller forever; now it
+        // returns `Timeout`. The watchdog thread separately terminates the
+        // runaway render at the same deadline so the worker is reclaimed (a
+        // pure non-allocating `while(true)` no longer wedges it permanently).
+        match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, response_rx).await {
+                    Ok(Ok(Ok(html))) => Ok(html),
+                    Ok(Ok(Err(msg))) => Err(PoolError::Render(msg)),
+                    Ok(Err(_)) => Err(PoolError::WorkerCrashed),
+                    Err(_elapsed) => Err(PoolError::Timeout),
+                }
+            }
+            None => match response_rx.await {
+                Ok(Ok(html)) => Ok(html),
+                Ok(Err(msg)) => Err(PoolError::Render(msg)),
+                Err(_) => Err(PoolError::WorkerCrashed),
+            },
         }
     }
 
@@ -201,8 +278,36 @@ impl V8Pool {
 impl Drop for V8Pool {
     fn drop(&mut self) {
         tracing::info!("🛑 Shutting down V8 pool");
-        // Channels will be dropped, workers will receive disconnect and exit
+        // Channels will be dropped, workers will receive disconnect and exit.
+        // Signal the watchdog thread to stop.
+        if let Some(wd) = &self.watchdog {
+            wd.shutdown.store(true, Ordering::Relaxed);
+        }
     }
+}
+
+/// Background thread that terminates renders which exceed `request_timeout`.
+fn spawn_watchdog(wd: Arc<Watchdog>) {
+    const CHECK_INTERVAL: Duration = Duration::from_millis(50);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(CHECK_INTERVAL);
+            if wd.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = wd.now();
+            for slot in &wd.slots {
+                let deadline = slot.deadline_nanos.load(Ordering::Relaxed);
+                if deadline != 0 && now >= deadline {
+                    if let Some(handle) = slot.handle.get() {
+                        // Interrupt the runaway render; it surfaces as an Err and
+                        // the worker frees up. Idempotent if already terminating.
+                        handle.terminate_execution();
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Spawn a worker thread
@@ -212,6 +317,8 @@ fn spawn_worker(
     worker_count: Arc<Mutex<usize>>,
     core_affinity: Option<Arc<Vec<CoreId>>>,
     next_core: Arc<AtomicUsize>,
+    max_heap_mb: Option<usize>,
+    watchdog: Option<Arc<Watchdog>>,
 ) {
     // Increment worker count
     {
@@ -232,13 +339,20 @@ fn spawn_worker(
             }
         }
 
-        // Initialize V8 runtime for this thread
-        if let Err(e) = runtime::init_runtime() {
+        // Initialize V8 runtime for this thread (with optional heap cap)
+        if let Err(e) = runtime::init_runtime(max_heap_mb) {
             tracing::error!("❌ Failed to initialize V8 for worker {}: {}", id, e);
             let mut count = worker_count.lock().unwrap();
             *count -= 1;
             return;
         }
+
+        // Register this worker's isolate handle with the watchdog so it can
+        // terminate a runaway render from another thread.
+        if let Some(wd) = &watchdog {
+            let _ = wd.slots[id].handle.set(runtime::isolate_handle());
+        }
+        let has_watchdog = watchdog.is_some();
 
         let mut requests_processed = 0usize;
 
@@ -259,15 +373,38 @@ fn spawn_worker(
                 // Prefetch data for better cache performance
                 prefetch_data(&req.data);
 
-                // Render via V8
-                let result = runtime::with_runtime(|js_runtime| {
-                    renderer::render_html(
-                        &req.url,
-                        Some(&req.data),
-                        &req.render_function,
-                        js_runtime,
-                    )
+                // Arm the watchdog for this render's deadline.
+                if let Some(wd) = &watchdog {
+                    wd.slots[id]
+                        .deadline_nanos
+                        .store(wd.now() + wd.timeout_nanos, Ordering::Relaxed);
+                }
+
+                // Render via V8, catching panics so a single bad render can't
+                // kill the worker thread (which would permanently shrink the
+                // pool). A caught panic becomes an error response; the worker
+                // keeps serving subsequent requests.
+                let result = runtime::with_runtime(|state| {
+                    // Clear any stray termination flag a watchdog may have set
+                    // between renders (race), so it can't abort this fresh one.
+                    if has_watchdog {
+                        state.runtime.v8_isolate().cancel_terminate_execution();
+                    }
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        renderer::render_html(
+                            &req.url,
+                            Some(&req.data),
+                            &req.render_function,
+                            state,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("render panicked".to_string()))
                 });
+
+                // Disarm the watchdog.
+                if let Some(wd) = &watchdog {
+                    wd.slots[id].deadline_nanos.store(0, Ordering::Relaxed);
+                }
 
                 // Send response
                 let _ = req.response_tx.send(result);
@@ -318,6 +455,7 @@ impl V8Pool {
             worker_count: Arc::new(Mutex::new(0)),
             core_affinity: None,
             next_core: Arc::new(AtomicUsize::new(0)),
+            watchdog: None,
         }
     }
 
@@ -330,6 +468,7 @@ impl V8Pool {
             pin_threads: false,
             request_timeout: Some(Duration::from_millis(10)),
             render_function: "renderPage".to_string(),
+            max_heap_mb: None,
         })
     }
 }

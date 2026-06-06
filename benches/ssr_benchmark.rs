@@ -30,6 +30,7 @@ fn bench_pool_config(c: &mut Criterion) {
                 pin_threads: false,
                 request_timeout: Some(Duration::from_secs(30)),
                 render_function: "renderPage".to_string(),
+                max_heap_mb: None,
             };
             black_box(config)
         })

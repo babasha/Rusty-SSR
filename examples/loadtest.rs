@@ -122,7 +122,10 @@ async fn main() {
         handles.push(tokio::spawn(async move {
             let mut i = task_id;
             while !stop.load(Ordering::Relaxed) {
-                // Pick URL: CACHE_HIT_RATIO% chance of reusing a "hot" URL (first 20)
+                // Pick URL: CACHE_HIT_RATIO% chance of reusing a "hot" URL (first 20).
+                // CACHE_HIT_RATIO is a tunable knob; at its default of 0 the hot
+                // branch is intentionally dead (every request is unique).
+                #[allow(clippy::absurd_extreme_comparisons)]
                 let url = if CACHE_HIT_RATIO > 0 && i % 100 < CACHE_HIT_RATIO {
                     urls[i % 20].clone() // hot set
                 } else {

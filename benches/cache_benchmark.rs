@@ -116,11 +116,11 @@ fn bench_cache_hits(c: &mut Criterion) {
     group.bench_function("l1_new_two_tier", |b| {
         let mut cache = HotCache::new();
         for i in 0..128u64 {
-            cache.insert(i, format!("<html>{}</html>", i).into());
+            cache.insert(i, Arc::from(format!("k{}", i)), format!("<html>{}</html>", i).into());
         }
 
         b.iter(|| {
-            let result = cache.peek(50);
+            let result = cache.peek(50, "k50");
             black_box(result)
         })
     });
@@ -130,11 +130,11 @@ fn bench_cache_hits(c: &mut Criterion) {
         let mut cache = HotCache::new();
         // Only insert 8 entries - all in ultra-hot array
         for i in 0..8u64 {
-            cache.insert(i, format!("<html>{}</html>", i).into());
+            cache.insert(i, Arc::from(format!("k{}", i)), format!("<html>{}</html>", i).into());
         }
 
         b.iter(|| {
-            let result = cache.peek(4); // Middle of array
+            let result = cache.peek(4, "k4"); // Middle of array
             black_box(result)
         })
     });
@@ -144,11 +144,11 @@ fn bench_cache_hits(c: &mut Criterion) {
         let mut cache = HotCache::new();
         // Insert 100 entries - first 92 will be in HashMap
         for i in 0..100u64 {
-            cache.insert(i, format!("<html>{}</html>", i).into());
+            cache.insert(i, Arc::from(format!("k{}", i)), format!("<html>{}</html>", i).into());
         }
 
         b.iter(|| {
-            let result = cache.peek(10); // Should be in HashMap
+            let result = cache.peek(10, "k10"); // Should be in HashMap
             black_box(result)
         })
     });

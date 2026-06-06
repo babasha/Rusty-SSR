@@ -186,6 +186,72 @@ let html = engine.render_with_data("/products", r#"{"page": 1}"#).await?;
 
 // Skip cache (always render fresh)
 let html = engine.render_uncached("/admin", "{}").await?;
+
+// Assemble the full document in a single pass: the cached fragment goes
+// into <!--ssr:outlet-->, and your per-request head tags into their own
+// placeholders — one allocation, no chained String::replace.
+let html = engine.render_to_html_with_replacements(
+    "/?listing=42",
+    "{}",
+    &[
+        ("<!--ssr:title-->", "Listing #42"),
+        ("<!--seo-->", "<meta property=\"og:title\" content=\"Listing #42\" />"),
+    ],
+).await?;
+```
+
+### What's in 0.1.1
+
+Correctness, robustness and efficiency overhaul:
+
+- **Cache key covers URL *and* data**, and the **full key is compared** on
+  lookup — `render_json(url, A)` and `render_json(url, B)` no longer collide,
+  and a 64-bit hash collision degrades to a miss (never serves wrong content).
+- **Errors/empty aren't frozen in cache**: a render that throws returns `Err`
+  (uncached); `.cache_empty(false)` skips caching empty output.
+- **Whole-request timeout**: `request_timeout` bounds enqueue *and* the render
+  wait, and a **watchdog terminates a runaway render** (even a non-allocating
+  `while(true)`) so the worker is reclaimed. A panicking render no longer kills
+  its worker.
+- **No per-request JS recompile**: the render function is resolved once and
+  invoked via a native call; URL/data are passed as V8 values (no
+  source-escaping pitfalls).
+- **Real LRU hot cache** (no FIFO drift / duplicate entries), **V8 heap cap**
+  (`.max_heap_mb`), **non-clobbering polyfills** with `URL`/`URLSearchParams`
+  (+ `.polyfills(false)`), single-pass template assembly, and a
+  `.cache_key_normalizer` for collapsing tracking-param URLs.
+
+### Cache-bypass for one-off URLs
+
+One-time and tracking URLs (`?reset=…`, `?verify=…`, `?utm_*`, `?fbclid=…`)
+shouldn't each take a slot in a fixed-size cache. Two tools:
+
+```rust
+// Render fresh + assemble the template, but never touch the cache:
+let html = engine
+    .render_to_html_uncached("/?reset=onetimetoken", "{}")
+    .await?;
+
+// Or collapse equivalent URLs onto one cache key (strip the query):
+fn strip_query(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).to_string()
+}
+let engine = SsrEngine::builder()
+    .bundle_path("ssr-bundle.js")
+    .cache_key_normalizer(strip_query) // utm/fbclid variants now share one entry
+    .build_engine()?;
+```
+
+### Memory cap
+
+On a small box, cap each isolate's heap. A render that exceeds it is
+terminated and returns `Err` (uncached) instead of aborting the process:
+
+```rust
+let engine = SsrEngine::builder()
+    .bundle_path("ssr-bundle.js")
+    .max_heap_mb(256)
+    .build_engine()?;
 ```
 
 ### Configuration
@@ -198,6 +264,9 @@ let html = engine.render_uncached("/admin", "{}").await?;
         .pin_threads(true)                 // Pin workers to CPU cores
         .cache_size(500)                   // Number of cached entries
         .cache_ttl_secs(300)               // Cache TTL (0 = forever)
+        .cache_empty(false)                // Don't cache empty renders (default: true)
+        .polyfills(true)                   // Built-in browser polyfills (default: true)
+        .max_heap_mb(512)                  // Per-isolate V8 heap cap (default: none)
         .render_function("renderPage")     // JS function name
         .build_engine()?;
 ```

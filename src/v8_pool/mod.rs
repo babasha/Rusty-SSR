@@ -24,5 +24,7 @@ mod pool;
 mod renderer;
 mod runtime;
 
-pub use bundle::{init_bundle, init_bundle_from_string, is_initialized};
+pub use bundle::{
+    init_bundle, init_bundle_from_string, init_bundle_raw, init_bundle_with, is_initialized,
+};
 pub use pool::{PoolError, V8Pool, V8PoolConfig};

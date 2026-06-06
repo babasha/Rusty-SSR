@@ -11,6 +11,17 @@ use crate::v8_pool::{PoolError, V8Pool};
 #[cfg(feature = "cache")]
 use crate::cache::SsrCache;
 
+#[cfg(feature = "cache")]
+use std::borrow::Cow;
+
+/// Separator between the URL part and the render-data part of a cache key.
+///
+/// U+001F (unit separator) never appears unescaped in a URL or in serde_json's
+/// compact output, so `normalize(url) + SEP + data` has an unambiguous boundary
+/// for URL-scoped invalidation.
+#[cfg(feature = "cache")]
+const CACHE_KEY_SEP: char = '\u{1f}';
+
 // ── HTML Template System ─────────────────────────────────────────────────────
 
 /// Parsed Vite manifest entry
@@ -123,8 +134,67 @@ impl HtmlTemplate {
 
     /// Inject rendered HTML fragment into the template
     fn inject(&self, fragment: &str) -> String {
-        self.content.replace("<!--ssr:outlet-->", fragment)
+        multi_replace(&self.content, &[("<!--ssr:outlet-->", fragment)])
     }
+
+    /// Assemble the final document in a single pass: the rendered fragment
+    /// goes into `<!--ssr:outlet-->`, and each caller-supplied placeholder is
+    /// replaced in the same left-to-right scan. One allocation, and
+    /// replacement values are never re-scanned (so a fragment that happens to
+    /// contain another placeholder string is emitted verbatim).
+    fn assemble(&self, fragment: &str, extra: &[(&str, &str)]) -> String {
+        let mut subs: Vec<(&str, &str)> = Vec::with_capacity(extra.len() + 1);
+        subs.push(("<!--ssr:outlet-->", fragment));
+        subs.extend_from_slice(extra);
+        multi_replace(&self.content, &subs)
+    }
+}
+
+/// Replace multiple distinct needles in `template` in a single left-to-right
+/// pass, producing one allocation.
+///
+/// Unlike chaining `str::replace` (one full scan + allocation per needle),
+/// this walks the template once. Inserted replacement values are not
+/// re-scanned, so a value containing another needle is emitted as-is.
+fn multi_replace(template: &str, replacements: &[(&str, &str)]) -> String {
+    // Capacity hint: assume each needle occurs ~once.
+    let extra: usize = replacements
+        .iter()
+        .map(|&(n, v)| v.len().saturating_sub(n.len()))
+        .sum();
+    let mut out = String::with_capacity(template.len() + extra);
+
+    let mut cursor = 0;
+    while cursor < template.len() {
+        // Find the earliest next occurrence of any needle at/after `cursor`.
+        let mut best: Option<(usize, &str, &str)> = None;
+        for &(needle, value) in replacements {
+            if needle.is_empty() {
+                continue;
+            }
+            if let Some(rel) = template[cursor..].find(needle) {
+                let pos = cursor + rel;
+                match best {
+                    Some((bpos, _, _)) if bpos <= pos => {}
+                    _ => best = Some((pos, needle, value)),
+                }
+            }
+        }
+
+        match best {
+            Some((pos, needle, value)) => {
+                out.push_str(&template[cursor..pos]);
+                out.push_str(value);
+                cursor = pos + needle.len();
+            }
+            None => {
+                out.push_str(&template[cursor..]);
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 // ── SSR Engine ───────────────────────────────────────────────────────────────
@@ -176,8 +246,8 @@ impl SsrEngine {
 
         #[cfg(feature = "v8-pool")]
         let v8_pool = {
-            // Initialize the V8 bundle
-            crate::v8_pool::init_bundle(&config.bundle_path)?;
+            // Initialize the V8 bundle (optionally with built-in polyfills)
+            crate::v8_pool::init_bundle_with(&config.bundle_path, config.polyfills)?;
 
             V8Pool::new(crate::v8_pool::V8PoolConfig {
                 num_threads: config.pool_size,
@@ -185,6 +255,7 @@ impl SsrEngine {
                 pin_threads: config.pin_threads,
                 request_timeout: config.request_timeout,
                 render_function: config.render_function.clone(),
+                max_heap_mb: config.max_heap_mb,
             })
         };
 
@@ -230,8 +301,13 @@ impl SsrEngine {
     /// * `data` - JSON string with data to pass to the render function
     #[cfg(all(feature = "v8-pool", feature = "cache"))]
     pub async fn render_with_data(&self, url: &str, data: &str) -> SsrResult<Arc<str>> {
+        // Cache key covers BOTH url and data (the render depends on both), with
+        // the URL normalized if a normalizer is configured. The original `url`
+        // and `data` are still what we render.
+        let key = self.compose_key(url, data);
+
         // Check cache first
-        if let Some(cached) = self.cache.try_get(url) {
+        if let Some(cached) = self.cache.try_get(&key) {
             tracing::debug!("Cache hit: {}", url);
             return Ok(cached);
         }
@@ -247,8 +323,14 @@ impl SsrEngine {
 
         let html: Arc<str> = Arc::from(html.as_str());
 
-        // Store in cache
-        self.cache.insert(url, Arc::clone(&html));
+        // Store in cache. Skip empty renders when `cache_empty` is off — a
+        // transient empty result (e.g. a suspended component returning "")
+        // would otherwise persist, and with `cache_ttl = None` survive until
+        // manual invalidation. Render *errors* never reach here: they
+        // propagate as `Err` from the V8 pool and are returned uncached.
+        if self.config.cache_empty || !html.is_empty() {
+            self.cache.insert(&key, Arc::clone(&html));
+        }
 
         Ok(html)
     }
@@ -311,6 +393,48 @@ impl SsrEngine {
         }
     }
 
+    /// Render a URL and assemble the final document in a single pass,
+    /// injecting the cached fragment into `<!--ssr:outlet-->` together with
+    /// any caller-supplied `replacements` (e.g. per-request `<head>` tags).
+    ///
+    /// This avoids the repeated full-document allocations you'd get from
+    /// chaining `String::replace` once per placeholder: the template is
+    /// walked once and replacement values are not re-scanned.
+    ///
+    /// If no template is configured, the rendered fragment is returned as-is
+    /// and `replacements` are ignored.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # async fn example(engine: SsrEngine) {
+    /// let title = "Listing #42";
+    /// let head = "<meta property=\"og:title\" content=\"Listing #42\" />";
+    /// let html = engine
+    ///     .render_to_html_with_replacements(
+    ///         "/?listing=42",
+    ///         "{}",
+    ///         &[("<!--ssr:title-->", title), ("<!--seo-->", head)],
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(all(feature = "v8-pool", feature = "cache"))]
+    pub async fn render_to_html_with_replacements(
+        &self,
+        url: &str,
+        data: &str,
+        replacements: &[(&str, &str)],
+    ) -> SsrResult<String> {
+        let fragment = self.render_with_data(url, data).await?;
+
+        match &self.template {
+            Some(tmpl) => Ok(tmpl.assemble(&fragment, replacements)),
+            None => Ok(fragment.to_string()),
+        }
+    }
+
     /// Check if the HTML template system is enabled
     pub fn has_template(&self) -> bool {
         self.template.is_some()
@@ -335,13 +459,80 @@ impl SsrEngine {
         self.render_uncached(url, &data.to_string()).await
     }
 
-    /// Invalidate a single cached URL
+    /// Render without caching, injecting the result into the HTML template.
     ///
-    /// Use after content updates for a specific page.
+    /// Like [`render_to_html_with_data`](Self::render_to_html_with_data) but
+    /// always hits V8 and never reads or writes the cache. Use for per-request
+    /// or one-off URLs — auth tokens (`?reset=…`, `?verify=…`), campaign links
+    /// (`?utm_*`, `?fbclid=…`) — that would otherwise pollute or thrash the
+    /// fixed-size cache. If no template is configured, the raw fragment is
+    /// returned.
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_to_html_uncached(&self, url: &str, data: &str) -> SsrResult<String> {
+        self.render_to_html_uncached_with_replacements(url, data, &[])
+            .await
+    }
+
+    /// Uncached template render with single-pass placeholder replacement.
+    ///
+    /// Combines the one-pass assembly of
+    /// [`render_to_html_with_replacements`](Self::render_to_html_with_replacements)
+    /// with a full cache bypass.
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_to_html_uncached_with_replacements(
+        &self,
+        url: &str,
+        data: &str,
+        replacements: &[(&str, &str)],
+    ) -> SsrResult<String> {
+        let fragment = self
+            .v8_pool
+            .render_with_data(url.to_string(), data.to_string())
+            .await
+            .map_err(Self::map_pool_error)?;
+
+        match &self.template {
+            Some(tmpl) => Ok(tmpl.assemble(&fragment, replacements)),
+            None => Ok(fragment),
+        }
+    }
+
+    /// Apply the configured normalizer to a URL (identity if none set).
+    #[cfg(feature = "cache")]
+    fn cache_key<'a>(&self, url: &'a str) -> Cow<'a, str> {
+        match self.config.cache_key_normalizer {
+            Some(f) => Cow::Owned(f(url)),
+            None => Cow::Borrowed(url),
+        }
+    }
+
+    /// Compose the full cache key from a URL and render data.
+    ///
+    /// The key is `normalize(url) + SEP + data` so renders that differ only by
+    /// data get distinct entries, and the URL part stays a prefix for
+    /// URL-scoped invalidation.
+    #[cfg(feature = "cache")]
+    fn compose_key(&self, url: &str, data: &str) -> String {
+        let normalized = self.cache_key(url);
+        let mut key = String::with_capacity(normalized.len() + 1 + data.len());
+        key.push_str(normalized.as_ref());
+        key.push(CACHE_KEY_SEP);
+        key.push_str(data);
+        key
+    }
+
+    /// Invalidate every cached entry for a URL (all data variants)
+    ///
+    /// Use after content updates for a specific page. Because cache keys
+    /// include the render data, this removes the page for *all* data variants.
+    /// The URL is normalized with the configured `cache_key_normalizer` (if any).
     #[cfg(feature = "cache")]
     pub fn invalidate(&self, url: &str) {
-        self.cache.invalidate(url);
-        tracing::debug!("Cache invalidated: {}", url);
+        // Keys are `normalize(url) + SEP + data`; removing every variant means
+        // removing all keys with this URL's prefix up to the separator.
+        let prefix = format!("{}{}", self.cache_key(url), CACHE_KEY_SEP);
+        let removed = self.cache.invalidate_prefix(&prefix);
+        tracing::debug!("Cache invalidated {} entr{} for: {}", removed, if removed == 1 { "y" } else { "ies" }, url);
     }
 
     /// Invalidate all cached URLs matching a prefix
@@ -411,5 +602,63 @@ impl SsrEngine {
             }
             PoolError::Render(msg) => SsrError::JsExecution(msg),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::multi_replace;
+
+    #[test]
+    fn single_placeholder() {
+        let out = multi_replace("a<!--x-->b", &[("<!--x-->", "FRAG")]);
+        assert_eq!(out, "aFRAGb");
+    }
+
+    #[test]
+    fn multiple_placeholders_one_pass() {
+        let tmpl = "<title><!--t--></title><head><!--seo--></head><body><!--ssr:outlet--></body>";
+        let out = multi_replace(
+            tmpl,
+            &[
+                ("<!--ssr:outlet-->", "<app/>"),
+                ("<!--seo-->", "<meta/>"),
+                ("<!--t-->", "Hello"),
+            ],
+        );
+        assert_eq!(out, "<title>Hello</title><head><meta/></head><body><app/></body>");
+    }
+
+    #[test]
+    fn replacement_values_are_not_rescanned() {
+        // The fragment contains a literal that matches another needle; it must
+        // be emitted verbatim, not re-replaced.
+        let tmpl = "[<!--ssr:outlet-->][<!--seo-->]";
+        let out = multi_replace(
+            tmpl,
+            &[
+                ("<!--ssr:outlet-->", "contains <!--seo--> literal"),
+                ("<!--seo-->", "TAGS"),
+            ],
+        );
+        assert_eq!(out, "[contains <!--seo--> literal][TAGS]");
+    }
+
+    #[test]
+    fn missing_placeholder_is_noop() {
+        let out = multi_replace("no markers here", &[("<!--x-->", "y")]);
+        assert_eq!(out, "no markers here");
+    }
+
+    #[test]
+    fn repeated_placeholder_all_replaced() {
+        let out = multi_replace("<!--x-->-<!--x-->", &[("<!--x-->", "Z")]);
+        assert_eq!(out, "Z-Z");
+    }
+
+    #[test]
+    fn empty_needle_is_skipped() {
+        let out = multi_replace("abc", &[("", "X"), ("b", "B")]);
+        assert_eq!(out, "aBc");
     }
 }

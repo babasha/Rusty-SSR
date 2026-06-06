@@ -44,6 +44,7 @@ mod pool_config_tests {
             pin_threads: true,
             request_timeout: Some(std::time::Duration::from_secs(1)),
             render_function: "customRender".to_string(),
+            max_heap_mb: None,
         };
 
         assert_eq!(config.num_threads, 4);
@@ -61,6 +62,7 @@ mod pool_config_tests {
             pin_threads: false,
             request_timeout: None,
             render_function: "render".to_string(),
+            max_heap_mb: None,
         };
 
         let cloned = config.clone();
@@ -90,6 +92,7 @@ mod pool_timeout_tests {
             pin_threads: false,
             request_timeout: Some(Duration::from_millis(5)),
             render_function: "renderPage".to_string(),
+            max_heap_mb: None,
         });
 
         let result = pool
@@ -508,15 +511,36 @@ mod v8_render_tests {
 
     #[tokio::test]
     async fn test_invalidate_forces_rerender() {
-        let engine = get_engine();
+        // Dedicated engine so cache metrics aren't shared with other tests.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("inv-bundle.js");
+        std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+        let engine = SsrEngine::builder()
+            .bundle_path(&bundle_path)
+            .pool_size(1)
+            .cache_size(50)
+            .build_engine()
+            .unwrap();
 
-        // Render and cache
+        // Render + cache, then confirm a second render is a cache hit.
         let _ = engine.render("/to-invalidate").await.unwrap();
-        assert!(engine.cache().try_get("/to-invalidate").is_some());
+        let m0 = engine.cache_metrics();
+        let _ = engine.render("/to-invalidate").await.unwrap();
+        let m1 = engine.cache_metrics();
+        assert!(
+            m1.hot_hits + m1.cold_hits > m0.hot_hits + m0.cold_hits,
+            "second render should be a cache hit"
+        );
 
-        // Invalidate
+        // After invalidation, the next render must miss (re-render).
         engine.invalidate("/to-invalidate");
-        assert!(engine.cache().try_get("/to-invalidate").is_none());
+        let m2 = engine.cache_metrics();
+        let _ = engine.render("/to-invalidate").await.unwrap();
+        let m3 = engine.cache_metrics();
+        assert!(
+            m3.misses > m2.misses,
+            "invalidate should force a re-render (cache miss)"
+        );
     }
 
     #[tokio::test]
@@ -527,6 +551,19 @@ mod v8_render_tests {
         assert!(html.contains("<html>"), "should render despite special chars in URL");
     }
 
+    // ── Item 3: URL passed as a native V8 value (no source interpolation) ──
+    // A newline, quotes and a line separator (U+2028) would have broken the
+    // old `format!`-into-JS-source approach; now they're harmless.
+    #[tokio::test]
+    async fn test_render_url_with_newline_and_quotes() {
+        let engine = get_engine();
+        let html = engine
+            .render("/p\n\"x\"\u{2028}y")
+            .await
+            .expect("URL with control chars must not break rendering");
+        assert!(html.contains("<html>"));
+    }
+
     #[tokio::test]
     async fn test_render_with_invalid_json_rejected() {
         let engine = get_engine();
@@ -535,6 +572,105 @@ mod v8_render_tests {
             .await;
 
         assert!(result.is_err(), "invalid JSON data should be rejected");
+    }
+
+    // ── Item 1: data is part of the cache key ────────────────────────────
+    #[tokio::test]
+    async fn test_data_is_part_of_cache_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("data-key-bundle.js");
+        std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+        let engine = SsrEngine::builder()
+            .bundle_path(&bundle_path)
+            .pool_size(1)
+            .cache_size(50)
+            .build_engine()
+            .unwrap();
+
+        let h1 = engine
+            .render_json("/p", serde_json::json!({ "page": 1 }))
+            .await
+            .unwrap();
+        let h2 = engine
+            .render_json("/p", serde_json::json!({ "page": 2 }))
+            .await
+            .unwrap();
+
+        assert!(h1.contains("\"page\":1"), "first render reflects page=1: {h1}");
+        assert!(
+            h2.contains("\"page\":2"),
+            "same url + different data must NOT serve the page=1 cache entry: {h2}"
+        );
+        assert_ne!(*h1, *h2, "different data must yield different cached results");
+    }
+
+    // ── Item 5: cache-key normalizer ─────────────────────────────────────
+    #[tokio::test]
+    async fn test_cache_key_normalizer_dedups_query() {
+        fn strip_query(url: &str) -> String {
+            url.split('?').next().unwrap_or(url).to_string()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("norm-bundle.js");
+        std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+
+        let engine = SsrEngine::builder()
+            .bundle_path(&bundle_path)
+            .pool_size(1)
+            .cache_size(50)
+            .cache_key_normalizer(strip_query)
+            .build_engine()
+            .unwrap();
+
+        let h1 = engine.render("/norm?a=1").await.unwrap();
+        let m1 = engine.cache_metrics();
+        let h2 = engine.render("/norm?b=2").await.unwrap();
+        let m2 = engine.cache_metrics();
+
+        assert_eq!(*h1, *h2, "URLs differing only by query should share a cache entry");
+        assert!(
+            h2.contains("/norm?a=1"),
+            "second call should serve the first (cached) render"
+        );
+        assert!(
+            m2.hot_hits + m2.cold_hits > m1.hot_hits + m1.cold_hits,
+            "second call should be a cache hit"
+        );
+    }
+
+    // ── Item 5: uncached template render ─────────────────────────────────
+    #[tokio::test]
+    async fn test_render_to_html_uncached_assembles_and_bypasses_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("unc-bundle.js");
+        std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+        let tmpl_path = dir.path().join("index.html");
+        std::fs::write(&tmpl_path, "<title><!--ssr:title--></title>X<!--ssr:outlet-->Y").unwrap();
+
+        let engine = SsrEngine::builder()
+            .bundle_path(&bundle_path)
+            .html_template(&tmpl_path)
+            .pool_size(1)
+            .build_engine()
+            .unwrap();
+
+        let html = engine
+            .render_to_html_uncached_with_replacements(
+                "/u",
+                "{}",
+                &[("<!--ssr:title-->", "T")],
+            )
+            .await
+            .unwrap();
+
+        assert!(html.starts_with("<title>T</title>X"), "title + outlet assembled: {html}");
+        assert!(html.contains("/u"), "rendered fragment injected into outlet");
+        assert!(html.ends_with("Y"));
+        assert!(
+            engine.cache().try_get("/u").is_none(),
+            "uncached render must not populate the cache"
+        );
     }
 }
 

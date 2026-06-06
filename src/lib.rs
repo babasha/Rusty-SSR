@@ -74,8 +74,9 @@ pub mod cache;
 #[cfg(feature = "axum-integration")]
 pub mod middleware;
 
-/// Prelude module for convenient imports
 pub mod prelude {
+    //! Prelude module for convenient imports
+    //!
     //! Convenient re-exports for common usage
     //!
     //! ```rust

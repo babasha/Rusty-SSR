@@ -26,7 +26,8 @@ pub struct SsrConfig {
     /// Cache TTL (None = no expiration)
     pub cache_ttl: Option<Duration>,
 
-    /// Request timeout for enqueueing render jobs
+    /// Timeout for the whole render request — enqueueing *and* waiting for the
+    /// V8 worker's response (None = wait indefinitely)
     pub request_timeout: Option<Duration>,
 
     /// Name of the global render function in JS bundle
@@ -47,6 +48,43 @@ pub struct SsrConfig {
     /// Used together with `html_template_path` to inject correct
     /// `<link>` and `<script>` tags with content-hashed filenames.
     pub assets_manifest_path: Option<PathBuf>,
+
+    /// Prepend the built-in browser polyfills to the bundle (default: true)
+    ///
+    /// Set to `false` when your bundle already provides every global it
+    /// needs (`window`, `document`, `URL`, …). The polyfills are otherwise
+    /// non-clobbering, so leaving this on is safe for most bundles.
+    pub polyfills: bool,
+
+    /// Cache empty render results (default: true)
+    ///
+    /// Set to `false` to skip caching renders that produce an empty string.
+    /// Useful when a framework returns `""` on a transient condition (e.g.
+    /// a suspended component) that you don't want frozen in the cache —
+    /// especially with `cache_ttl = None`, where it would persist until
+    /// manual invalidation.
+    pub cache_empty: bool,
+
+    /// Maximum V8 heap size per worker isolate, in megabytes (default: none)
+    ///
+    /// When set, each isolate is created with this heap cap. A render that
+    /// would exceed it has its execution terminated and returns an error
+    /// (uncached) instead of aborting the whole process — useful on
+    /// memory-constrained hosts. The cap is approximate: V8 may briefly
+    /// exceed it while unwinding the over-budget render. `None` = V8 default
+    /// (effectively unbounded).
+    pub max_heap_mb: Option<usize>,
+
+    /// Optional cache-key normalizer applied to the URL before lookup/insert
+    ///
+    /// Return a canonical key so URLs that render identically share one cache
+    /// entry — e.g. strip tracking params (`utm_*`, `fbclid`) or sort the
+    /// query string. `None` = use the URL verbatim (zero overhead).
+    ///
+    /// Only affects cache keying; the original URL is still passed to the
+    /// render function. `invalidate` normalizes too; `invalidate_prefix`
+    /// matches on the (normalized) stored keys.
+    pub cache_key_normalizer: Option<fn(&str) -> String>,
 }
 
 impl Default for SsrConfig {
@@ -62,6 +100,10 @@ impl Default for SsrConfig {
             render_function: "renderPage".to_string(),
             html_template_path: None,
             assets_manifest_path: None,
+            polyfills: true,
+            cache_empty: true,
+            max_heap_mb: None,
+            cache_key_normalizer: None,
         }
     }
 }
@@ -86,6 +128,10 @@ pub struct SsrConfigBuilder {
     render_function: Option<String>,
     html_template_path: Option<PathBuf>,
     assets_manifest_path: Option<PathBuf>,
+    polyfills: Option<bool>,
+    cache_empty: Option<bool>,
+    max_heap_mb: Option<usize>,
+    cache_key_normalizer: Option<fn(&str) -> String>,
 }
 
 impl SsrConfigBuilder {
@@ -203,6 +249,60 @@ impl SsrConfigBuilder {
         self
     }
 
+    /// Enable or disable the built-in browser polyfills (default: true)
+    ///
+    /// When `false`, the bundle is loaded verbatim with no polyfills
+    /// prepended. Use this if your bundle already provides every global it
+    /// needs — otherwise leave it on (the polyfills are non-clobbering, so
+    /// a bundle can still override any of them).
+    pub fn polyfills(mut self, enabled: bool) -> Self {
+        self.polyfills = Some(enabled);
+        self
+    }
+
+    /// Cache empty render results (default: true)
+    ///
+    /// Set to `false` to avoid caching renders that produce an empty
+    /// string. With `cache_ttl = None`, a once-empty render would otherwise
+    /// persist in the cache until manual invalidation.
+    pub fn cache_empty(mut self, enabled: bool) -> Self {
+        self.cache_empty = Some(enabled);
+        self
+    }
+
+    /// Set a maximum V8 heap size per worker isolate, in megabytes
+    ///
+    /// A render exceeding the cap is terminated and returns an error
+    /// (uncached) rather than aborting the process. Omit for no limit.
+    pub fn max_heap_mb(mut self, mb: usize) -> Self {
+        self.max_heap_mb = Some(mb);
+        self
+    }
+
+    /// Set a cache-key normalizer applied to the URL before lookup/insert
+    ///
+    /// Use it to collapse URLs that render identically onto one cache entry
+    /// (e.g. strip `utm_*`/`fbclid`, sort query params). The original URL is
+    /// still passed to the render function.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rusty_ssr::SsrConfig;
+    ///
+    /// fn strip_query(url: &str) -> String {
+    ///     url.split('?').next().unwrap_or(url).to_string()
+    /// }
+    ///
+    /// let config = SsrConfig::builder()
+    ///     .cache_key_normalizer(strip_query)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn cache_key_normalizer(mut self, f: fn(&str) -> String) -> Self {
+        self.cache_key_normalizer = Some(f);
+        self
+    }
+
     /// Build the configuration
     ///
     /// # Errors
@@ -225,6 +325,10 @@ impl SsrConfigBuilder {
             render_function: self.render_function.unwrap_or(default.render_function),
             html_template_path: self.html_template_path,
             assets_manifest_path: self.assets_manifest_path,
+            polyfills: self.polyfills.unwrap_or(default.polyfills),
+            cache_empty: self.cache_empty.unwrap_or(default.cache_empty),
+            max_heap_mb: self.max_heap_mb,
+            cache_key_normalizer: self.cache_key_normalizer,
         };
 
         if config.pool_size == 0 {
@@ -304,6 +408,24 @@ mod tests {
             .render_function("foo; evil()")
             .build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_polyfills_and_cache_empty_defaults() {
+        let config = SsrConfig::default();
+        assert!(config.polyfills);
+        assert!(config.cache_empty);
+    }
+
+    #[test]
+    fn test_polyfills_and_cache_empty_overrides() {
+        let config = SsrConfig::builder()
+            .polyfills(false)
+            .cache_empty(false)
+            .build()
+            .unwrap();
+        assert!(!config.polyfills);
+        assert!(!config.cache_empty);
     }
 
     #[test]

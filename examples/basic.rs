@@ -12,7 +12,6 @@
 use axum::{extract::State, response::Html, routing::get, Router};
 use rusty_ssr::prelude::*;
 use std::sync::Arc;
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() {
