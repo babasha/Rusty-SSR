@@ -1,480 +1,277 @@
-# 🚀 Performance Benchmark Guide
+# Benchmarks
 
-Comprehensive benchmark suite for testing the Rust SSR server with multi-tier caching and V8 thread pool.
+Every figure here was measured, and each one says what it was measured on. The
+file it replaced quoted competitor throughput with a `~` and no method, and
+projected AWS bills from a number that never rendered anything; none of that
+survived being checked, so none of it is here.
 
-## 🏆 Actual Results (MacBook Pro M1/M2)
+## The one rule for reading SSR benchmarks
 
-**Hardware tested:** Apple Silicon (10 cores), 16GB RAM
+**A cached response and a rendered page differ by fifty times.** Quote one
+without saying which, and the number means nothing:
 
-### Quick Results Summary
+| | pages/s | p50 |
+|---|---|---|
+| Served from the page cache | 48,029 | 1.04 ms |
+| Actually rendered | 950 | 17.1 ms |
 
-| Test Type | Throughput | Latency | Status |
-|-----------|-----------|---------|--------|
-| **curl (sequential)** | 2,770 req/s | 0.361ms | ✅ |
-| **curl (sustained)** | 899 req/s | - | ✅ |
-| **wrk (400 conns)** | **40,781 req/s** | 10.38ms | 🚀 |
-| **wrk (1000 conns)** | **73,304 req/s** | 18.37ms | 🔥 |
-| **Cache hit (hot)** | - | **0.195ms** | ⚡ |
+Both are real, from the same server, same page, minutes apart. The first is a
+memory copy and a socket write; the second is V8 executing your bundle. Almost
+every "N requests per second" claim about an SSR engine — including the ones
+this project used to make — is the first number wearing the second's name.
 
-### Detailed Results
+This matters practically because general-purpose load tools cannot tell them
+apart. `wrk`, `bombardier` and `ab` all hammer one URL, so against any engine
+with a page cache they measure the cache. `examples/loadgen.rs` exists for that
+reason: `--distinct` appends a unique query to every request, so the cache
+misses every time and you measure what the server can build.
+
+## Hardware and method
+
+- **CPU**: AMD Ryzen 7 260, 8 physical cores / 16 logical
+- **RAM**: 16 GB
+- **OS**: Windows 11 for the synthetic runs; WSL2 (Arch, kernel 6.6) for the
+  application runs
+- **Load generator on the same machine.** It competes for the same cores, which
+  depresses every figure below and depresses the high-`pool_size` ones most.
+- Runs are sequential, never concurrent. Each is preceded by a discarded warm-up.
+- V8 tiers up from its interpreter after a few hundred calls, so **every run
+  warms first**. Skipping that reported a 45 µs render as 315 µs.
+
+## 1. A real application
+
+The most useful numbers here, because nothing is synthetic: a deployed Rust
+service (axum + sqlx/Postgres) embedding this crate, rendering a 2.5 MB Preact
+bundle into 200–320 kB pages, with database queries behind them.
+`pool_size = 16`, page cache of 150 entries with a 5-minute TTL and a stale
+window.
+
+**Served from the page cache** — one hot URL:
+
+| route | page size | pages/s | p50 | p99 |
+|---|---|---|---|---|
+| `/` | 323 kB | 48,029 | 1.04 ms | 5.61 ms |
+| `/venda/blumenau` | 195 kB | 25,100 | 2.36 ms | 6.96 ms |
+| `/aluguel/blumenau` | 308 kB | 20,892 | 2.93 ms | 7.83 ms |
+
+15.5 GB/s on the first row: at that point the bottleneck is `memcpy` and the
+socket, not this crate.
+
+**Actually rendering** — a distinct URL every request:
+
+| connections | pages/s | p50 | p99 |
+|---|---|---|---|
+| 16 | 901 | 17.1 ms | 31.2 ms |
+| 64 | 947 | 66.2 ms | 94.6 ms |
+| 128 | 981 | 128.4 ms | 165.5 ms |
+
+**Throughput saturates at `connections = pool_size`.** Going from 16 to 128
+bought 9% more throughput and made p50 seven times worse: past saturation,
+added concurrency is queue delay and nothing else. The arithmetic closes —
+16 workers ÷ 950 pages/s = 16.8 ms per page, and p50 at 16 connections was
+17.05 ms.
+
+### Where the 17 ms goes
+
+The same route with `SSR_DISABLE=1`, which serves the static shell and skips
+the render, isolates what rendering costs:
+
+| | one connection | 16 connections |
+|---|---|---|
+| SSR on | p50 7.91 ms | 825 pages/s |
+| SSR off | p50 5.38 ms | 2,570 pages/s |
+
+**The render is 2.53 ms of a 7.9 ms request** — under a third. The rest is
+routing, database queries, SEO tags and shell assembly. But it is the part that
+serialises: removing it triples throughput under concurrency, because the render
+is CPU-bound across a fixed pool while the queries are not.
+
+Two consequences. Making the render free would improve a single request by about
+1.5×, not 3×. And optimising the engine underneath it is chasing a fraction of
+a fraction — at 17 ms per page, this crate's own overhead is fractions of a
+percent.
+
+### How many workers are worth having
+
+Measured by pinning the server to a subset of cores, which is also what
+`num_cpus::get()` reads:
+
+| cores | pool_size | pages/s | p50 | RSS |
+|---|---|---|---|---|
+| 4 | 4 | 587 | 53.8 ms | 513 MB |
+| 8 | 8 | 882 | 35.7 ms | 933 MB |
+| 12 | 12 | 973 | 32.3 ms | 1,338 MB |
+| 16 | 16 | 977 | 32.1 ms | 1,738 MB |
+
+**Throughput saturates at about 12 workers on 8 physical cores; memory does
+not.** Going from 12 to 16 bought 0.4% more throughput for 400 MB more RSS, and
+8 workers held 90% of peak throughput on 54% of the memory. Oversubscription is
+not the problem — the extra workers simply stop paying for themselves while
+continuing to cost.
+
+Pick `pool_size` against that curve rather than against the core count.
+
+### Sizing from these numbers
+
+The pool is the ceiling, so capacity is set by how often you miss the cache:
 
 ```
-╔══════════════════════════════════════════════════════════╗
-║              🏆 PRODUCTION BENCHMARK RESULTS             ║
-╠══════════════════════════════════════════════════════════╣
-║                                                          ║
-║  Standard Tests (curl):                                  ║
-║    • Sequential:          2,770 req/s                    ║
-║    • Concurrent (1k):       467 req/s                    ║
-║    • Sustained (10k):       899 req/s                    ║
-║                                                          ║
-║  Production Tests (wrk):                                 ║
-║    • 400 connections:    40,781 req/s  ⚡                ║
-║    • 1000 connections:   73,304 req/s  🚀🚀              ║
-║                                                          ║
-║  Latency Metrics:                                        ║
-║    • Cache hit (hot):      0.195ms                       ║
-║    • Cache hit (cold):     0.238ms                       ║
-║    • Under load (400):    10.38ms                        ║
-║    • Under load (1000):   18.37ms                        ║
-║                                                          ║
-║  Stability:                                              ║
-║    • Total requests:      1,960,000+                     ║
-║    • Failures:            0 ✅                           ║
-║    • Uptime:              100% ✅                        ║
-║    • Memory stable:       Yes ✅                         ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
+sustained req/s  ≤  950 / (1 − hit_rate)
 ```
 
-### Comparison with Industry Standards
+| hit rate | sustained req/s |
+|---|---|
+| 90% | ~9,500 |
+| 95% | ~19,000 |
+| 99% | ~95,000 |
 
-| Framework | Technology | Throughput | Latency | vs This |
-|-----------|-----------|------------|---------|---------|
-| **This Server** | Rust + V8 | **73,304 req/s** | 18.37ms | **1x** 🏆 |
-| Next.js | Node.js | ~5,000 req/s | 25-50ms | **0.07x** |
-| Remix | Node.js | ~6,000 req/s | 20-40ms | **0.08x** |
-| SvelteKit | Node.js | ~4,000 req/s | 30-60ms | **0.05x** |
-| Fresh | Deno | ~12,000 req/s | 15-30ms | **0.16x** |
-| Go SSR | Go | ~25,000 req/s | 10-20ms | **0.34x** |
-| NGINX (static) | C | ~50,000 req/s | 5-10ms | **0.68x** |
+A cold cache after a deploy is therefore the dangerous moment: whatever the
+steady state, the first seconds run at 950/s.
 
-**Result: 10-15x faster than Node.js SSR, 3x faster than Go SSR!** 🚀
+**Memory**: 507 MB at boot, 1.65 GB after a six-second warm-up, 1.77 GB at the
+end and flat — roughly 70 MB per isolate with a 2.5 MB bundle. That is the
+working set, not a leak, and the page cache is not in it (150 entries ≈ 45 MB).
+Cap each isolate with `max_heap_mb` so a runaway render fails instead of growing.
 
-## Quick Start
+## 2. Against Node and Next.js
+
+Same machine, same 20-card page, and — where it is shared — the same bundle.
+20 s at 64 connections, plain HTML both sides (Next's compression disabled so
+neither trades CPU for bytes).
+
+| | pages/s | p50 | p99 | bytes/page |
+|---|---|---|---|---|
+| rusty-ssr + Preact, `pool_size=16` | 18,475 | 3.38 ms | 6.88 ms | 24,483 |
+| rusty-ssr + React, `pool_size=16` | 19,802 | 3.13 ms | 6.41 ms | 24,894 |
+| rusty-ssr + Preact, `pool_size=1` | 2,421 | 25.8 ms | 33.7 ms | 24,483 |
+| rusty-ssr + React, `pool_size=1` | 2,560 | 24.5 ms | 31.4 ms | 24,894 |
+| Node + the same Preact bundle | 2,250 | 28.1 ms | 42.9 ms | 24,483 |
+| Node + React `renderToString` | 2,206 | 30.7 ms | 69.0 ms | 24,894 |
+| Next.js 15.5 App Router (RSC) | 125 | 492 ms | 638 ms | 77,102 |
+
+Three things follow, and only the third is about this crate:
+
+1. **Per render thread, this engine is at parity with Node.** 2,421 against
+   2,250 with the identical bundle — about 1.1×, which run-to-run variance can
+   account for most of. Rendering is V8 executing bytecode, and it is the same
+   V8; there is no mechanism by which Rust makes it faster.
+2. **React and Preact render at the same speed.** 2,206 against 2,250 on Node,
+   2,560 against 2,421 here. The 17.7× gap between Node + React and Next.js is
+   therefore *not* React — it is the App Router's RSC pipeline and the 77 kB
+   hydration payload it emits against 24 kB of markup.
+3. **The advantage is 7.6× of in-process scaling.** 2,421 → 18,475 by running
+   16 isolates in one process. Matching that with Node means about nine
+   processes, each with its own heap, its own compiled copy of the bundle and
+   its own fragmented cache.
+
+Multiplying out: 17.7 × 1.16 × 7.7 ≈ 158, against the 148× measured end to end
+between Next.js and this at `pool_size=16`. Two of those three factors belong to
+somebody else.
+
+**Caveats.** Next.js was measured in App Router / RSC mode, which is React's
+slowest server path and emits a hydratable payload — it is doing strictly more
+work than the other rows. Next was also run as one process, as it ships;
+scaling it means running several, which is the memory comparison rather than
+the throughput one. Pages Router would be faster and was not measured.
+
+## 3. Engine microbenchmarks
+
+`cargo bench --bench hotpath_benchmark --all-features` walks the paths a request
+takes, through the public API.
+
+| | |
+|---|---|
+| Fragment-cache hit (hot tier) | 42–69 ns |
+| Fragment-cache miss | 34–52 ns |
+| Fragment-cache insert | 0.39–0.53 µs |
+| Page-cache `get` hit | 130–300 ns |
+| 60 kB JSON payload delivered to the bundle | ~300 µs |
+
+### On trusting these numbers
+
+**Run the same unchanged code twice and criterion will report a 32%
+improvement, with `p = 0.00`.** A laptop's clock speed depends on how warm it
+is, and these benchmarks are short enough to sit inside that drift. Anything
+under about a third is a statement about the machine.
+
+The ranges above are the spread across independent runs, not error bars. Where a
+figure has to be trusted, get it one of two ways: a large effect reproduced
+across separate runs, or a ratio between two benchmarks *inside one run*, where
+the drift cancels.
+
+## 4. Pool sizing
+
+Measured with a synthetic bundle so the render cost could be dialled.
+
+**Render cost against page size** (single-threaded, warmed):
+
+| listings | HTML | per render | ceiling per worker |
+|---|---|---|---|
+| 1 | 2 kB | 44.9 µs | 22,282/s |
+| 20 | 24 kB | 287.9 µs | 3,473/s |
+| 50 | 60 kB | 692.2 µs | 1,445/s |
+| 200 | 238 kB | 3.15 ms | 318/s |
+
+**Scaling with workers** (2 kB page, 64 connections):
+
+| pool_size | pages/s | vs one worker |
+|---|---|---|
+| 1 | 42,601 | 1.0× |
+| 2 | 84,208 | 2.0× |
+| 4 | 153,351 | 3.6× |
+| 8 | 218,959 | 5.1× |
+| 16 | 265,144 | 6.2× |
+
+Sub-linear, and it should be: 16 workers on 8 physical cores is a 2×
+oversubscription, and the runtime feeding them needs CPU too. Past roughly 1.5×
+the physical core count, throughput barely moves while p99 degrades sharply — at
+`pool_size=24` throughput rose 15% and p99 went from 12 ms to 32 ms.
+
+**Memory per isolate**: ~36 MB baseline, plus about four times the bundle's size
+again for compiled code — 1.7 MB of JS added ~7 MB per isolate. Start-up is
+~70 ms per isolate for a small bundle and ~100 ms for a 1.7 MB one, in parallel
+across the pool, so V8 snapshots would not buy much.
+
+**`num_cpus::get()` is the wrong default inside a container.** It reads CPU
+affinity, not the CFS quota, so on a 32-core host it returns 32 however small
+your container's share. At ~36 MB per isolate that is over a gigabyte allocated
+before the first request. Take `pool_size` from your platform's variable.
+
+## Reproducing
 
 ```bash
-# 1. Start the server in release mode (optimized)
-cargo run --release
+# Engine microbenchmarks. Compare against a saved baseline, and read the
+# note above about the noise floor before believing a small change.
+cargo bench --bench hotpath_benchmark --all-features -- --save-baseline before
+cargo bench --bench hotpath_benchmark --all-features -- --baseline before
 
-# 2. In another terminal, run the benchmark
-./benchmark.sh
+# An HTTP server around the engine, for comparing against other stacks.
+cargo run --release --example http_server --features axum-integration -- \
+    --bundle path/to/ssr-bundle.js --rows 20 --pool-size 16
+
+# Load, both ways. --distinct is the one that measures rendering.
+cargo run --release --example loadgen -- http://127.0.0.1:3001/render/1 \
+    --connections 64 --duration 20
+cargo run --release --example loadgen -- http://127.0.0.1:3001/render/1 \
+    --connections 64 --duration 20 --distinct
+
+# In-process, with a payload-size dial and no HTTP in the way.
+cargo run --release --example loadtest -- \
+    --bundle path/to/ssr-bundle.js --rows 50 --hit-ratio 0 --duration 30
 ```
 
-## What Gets Tested
-
-### Test 1: Single Request Latency ⚡
-- **What**: Measures average response time for cached content
-- **How**: 100 sequential requests
-- **Metric**: Average latency in milliseconds
-- **Expected**: < 1ms (sub-millisecond response time)
-
-### Test 2: Concurrent Requests 🔀
-- **What**: Tests server under parallel load
-- **How**: 1,000 simultaneous curl requests
-- **Metric**: Total duration and throughput (req/s)
-- **Expected**: ~500-1000 req/s
-
-### Test 3: Sustained Load 📊
-- **What**: Tests stability under prolonged load
-- **How**: 10,000 requests in batches of 100
-- **Metric**: Average throughput over full duration
-- **Expected**: ~800-1000 req/s
-
-### Test 4: Cache Performance 💾
-- **What**: Compares cold vs hot cache performance
-- **How**: Measures first request vs subsequent cached requests
-- **Metric**: Latency comparison
-- **Expected**: ~0.2ms for cache hits
-
-## Prerequisites
-
-- **Rust server running** on `http://localhost:3000`
-- **curl** installed (pre-installed on macOS/Linux)
-- **bc** calculator (pre-installed on macOS/Linux)
-
-## Installation
-
-```bash
-# Make the script executable (first time only)
-chmod +x benchmark.sh
-```
-
-## Running Benchmarks
-
-### Standard Benchmark
-```bash
-./benchmark.sh
-```
-
-### For Presentations/Demos
-```bash
-# Clear terminal first for clean output
-clear && ./benchmark.sh
-```
-
-### Save Results to File
-```bash
-./benchmark.sh > benchmark-results-$(date +%Y%m%d-%H%M%S).txt
-```
-
-### Compare Debug vs Release
-```bash
-# Terminal 1: Start debug server
-cargo run
-
-# Terminal 2: Run benchmark
-./benchmark.sh > results-debug.txt
-
-# Terminal 1: Stop and restart in release
-cargo run --release
-
-# Terminal 2: Run benchmark again
-./benchmark.sh > results-release.txt
-
-# Compare
-diff results-debug.txt results-release.txt
-```
-
-## Understanding Results
-
-### Example Output
-```
-╔════════════════════════════════════════════════════════════╗
-║                    📈 BENCHMARK SUMMARY                    ║
-╠════════════════════════════════════════════════════════════╣
-║  Average Latency:      0.366ms                             ║
-║  Peak Throughput:      ~892 req/s                          ║
-║  Cache Hit Latency:    0.190ms                             ║
-║  Total Requests:       11,100                              ║
-╚════════════════════════════════════════════════════════════╝
-```
-
-### What These Numbers Mean
-
-- **Average Latency (0.366ms)**: Time for server to respond from cache
-  - **Excellent**: < 1ms
-  - **Good**: 1-5ms
-  - **Slow**: > 10ms
-
-- **Peak Throughput (892 req/s)**: Requests handled per second
-  - **Note**: Limited by curl process overhead, not server capacity
-  - Real-world production can handle 10,000+ req/s with proper HTTP client
-
-- **Cache Hit Latency (0.19ms)**: Fastest possible response from L1/L2 cache
-  - Shows multi-tier cache effectiveness
-  - Near-instant response time
-
-## Architecture Details
-
-The benchmark tests this architecture:
-
-```
-┌─────────────────────────────────────────────────────┐
-│  Request → Axum Router → SSR Handler                │
-│                              ↓                       │
-│              ┌───────────────────────────┐          │
-│              │   Multi-tier Cache        │          │
-│              │  ┌─────────────────────┐  │          │
-│              │  │  L1/L2 Hot Cache    │  │ ~0.2ms   │
-│              │  │  (Thread-local)     │  │          │
-│              │  └─────────────────────┘  │          │
-│              │           ↓ miss           │          │
-│              │  ┌─────────────────────┐  │          │
-│              │  │  RAM Cold Cache     │  │ ~1ms     │
-│              │  │  (DashMap shared)   │  │          │
-│              │  └─────────────────────┘  │          │
-│              └────────────┬──────────────┘          │
-│                           ↓ miss                     │
-│              ┌─────────────────────┐                │
-│              │   V8 Thread Pool    │                │
-│              │   (10 workers)      │  ~50-100ms     │
-│              │   SSR Rendering     │                │
-│              └─────────────────────┘                │
-└─────────────────────────────────────────────────────┘
-```
-
-## Performance Optimizations Tested
-
-✅ **L1/L2 CPU Cache**: Thread-local hot cache (8 entries)
-✅ **RAM Cache**: Shared DashMap cold cache (300 entries)
-✅ **Auto-promotion**: Cold → Hot on access
-✅ **Zero-copy**: `Arc<str>` shared references
-✅ **V8 Pool**: Fixed 10 workers (= CPU cores)
-✅ **Brotli**: Static assets pre-compressed
-
-## Troubleshooting
-
-### "Connection refused"
-```bash
-# Server not running. Start it:
-cargo run --release
-```
-
-### Slow results (> 10ms average)
-```bash
-# Make sure you're using release mode:
-cargo run --release  # NOT just "cargo run"
-```
-
-### "bc: command not found"
-```bash
-# Install bc calculator:
-brew install bc  # macOS
-apt-get install bc  # Linux
-```
-
-## CI/CD Integration
-
-Add to your CI pipeline:
-
-```yaml
-# .github/workflows/benchmark.yml
-- name: Run benchmarks
-  run: |
-    cargo run --release &
-    sleep 5
-    ./benchmark.sh > benchmark-results.txt
-    cat benchmark-results.txt
-```
-
-## Advanced Benchmarks (wrk)
-
-### Installation
-
-```bash
-# Install wrk for production-grade benchmarks
-brew install wrk  # macOS
-apt-get install wrk  # Linux
-```
-
-### Test 5: Production Load (400 connections)
-
-**Command:**
-```bash
-wrk -t12 -c400 -d30s http://localhost:3000/
-```
-
-**Actual Results:**
-```
-Running 30s test @ http://localhost:3000/
-  12 threads and 400 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    10.38ms    8.62ms 127.42ms   81.00%
-    Req/Sec     3.42k     2.04k    8.61k    76.14%
-  1,224,747 requests in 30.03s, 1.74GB read
-
-Requests/sec:  40,781.31 🚀
-Transfer/sec:  59.35MB
-```
-
-**Analysis:**
-- **1.22 million requests** in 30 seconds
-- **40,781 req/s** sustained throughput
-- **10.38ms** average latency under load
-- **Zero errors** across all requests
-- **Thread efficiency:** 99.4% (near perfect)
-
-### Test 6: Extreme Load (1000 connections)
-
-**Command:**
-```bash
-wrk -t12 -c1000 -d10s http://localhost:3000/
-```
-
-**Actual Results:**
-```
-Running 10s test @ http://localhost:3000/
-  12 threads and 1000 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency    18.37ms   23.39ms 189.57ms   92.81%
-    Req/Sec     6.15k     1.75k    7.90k    88.31%
-  734,217 requests in 10.02s, 1.04GB read
-
-Requests/sec:  73,304.09 🔥🔥🔥
-Transfer/sec:  106.68MB
-```
-
-**Analysis:**
-- **734k requests** in 10 seconds
-- **73,304 req/s** peak throughput
-- **18.37ms** average latency
-- **92.81%** of requests within 1 standard deviation
-- **100% success rate**
-
-### Performance Scaling
-
-| Connections | Throughput | Latency | Efficiency |
-|-------------|-----------|---------|------------|
-| 1 (seq) | 2,770 req/s | 0.361ms | Baseline |
-| 100 (curl) | 899 req/s | - | Process overhead |
-| 400 (wrk) | 40,781 req/s | 10.38ms | **14.7x** 🚀 |
-| 1000 (wrk) | **73,304 req/s** | 18.37ms | **26.5x** 🔥 |
-
-**Conclusion:** Nearly linear scaling up to 1000 concurrent connections!
-
-## AWS Production Projections
-
-### c7gn.16xlarge (Network Optimized)
-
-**Specs:**
-- 64 vCPUs (ARM Graviton3)
-- 128GB RAM
-- 200 Gbps network
-- Cost: ~$2,400/month
-
-**Projected Performance:**
-```
-Expected throughput: ~725,000 req/s
-Daily capacity: ~62 billion requests
-Monthly capacity: ~1.9 trillion requests
-
-Scaling factor vs MacBook:
-├─ CPU: 64/10 = 6.4x
-├─ Network: 200Gbps vs 0.3Gbps = 667x
-├─ L3 Cache: Enhanced = +20%
-└─ Total: ~10x improvement
-```
-
-**Real-world comparison:**
-- **Twitter/X:** ~50-100B requests/day → **1 server handles it!**
-- **Medium:** ~300M requests/day → **3% of capacity**
-- **Amazon.com:** ~15B requests/day → **4 servers = entire Amazon**
-
-### Cost Comparison (5 billion req/day)
-
-| Solution | Servers | Cost/month | Notes |
-|----------|---------|------------|-------|
-| **This (Rust)** | 1× c6gn.16xlarge | **$1,500** | 38B capacity, 7.6x headroom |
-| Next.js | 100× t3.xlarge | $6,000 | 50M each |
-| Vercel | N/A | $2,400 | Managed service |
-| Go SSR | 3× c6g.8xlarge | $1,800 | Similar perf |
-
-**Savings: $4,500/month vs Next.js = $54,000/year** 💰
-
-### Recommended AWS Setup by Scale
-
-| Daily Traffic | Instance | vCPUs | Cost/month | Headroom |
-|---------------|----------|-------|------------|----------|
-| < 1B | t3.medium | 2 | $30 | 40x |
-| 1-10B | c6g.xlarge | 4 | $120 | 4x |
-| 10-50B | c6gn.16xlarge | 64 | $1,500 | 2x |
-| 50-100B | 2× c7gn.16xlarge | 128 | $4,800 | 2x |
-| > 100B | 3+ c7gn.16xlarge | 192+ | $7,200+ | Scale as needed |
-
-## Notes
-
-- **curl overhead**: The ~800-1000 req/s is limited by curl process spawning, NOT server capacity
-- **Real performance**: Validated at **73,304 req/s** with wrk on MacBook
-- **Cache hit rate**: 95%+ hot cache hits in production workloads
-- **Latency**: Sub-millisecond (0.195ms) response time from L1/L2 cache
-- **Production capacity**: **6.3 billion requests/day** on single MacBook
-- **Scaling**: Nearly linear up to 1000+ concurrent connections
-- **Stability**: 1.96M+ requests tested with zero failures
-
-## Advanced Usage
-
-### Test Different Cache Sizes
-
-Edit `src/main.rs`:
-```rust
-let ssr_cache = SSRCache::new(300); // Change this number
-```
-
-### Test Different Worker Counts
-
-Edit `src/enndel_core_v8pool/adaptive_pool.rs`:
-```rust
-pub struct AdaptivePoolConfig {
-    pub num_threads: usize, // Modify default
-}
-```
-
-### Custom Benchmark Script
-
-Copy and modify `benchmark.sh`:
-```bash
-cp benchmark.sh my-custom-benchmark.sh
-# Edit my-custom-benchmark.sh to test specific scenarios
-chmod +x my-custom-benchmark.sh
-./my-custom-benchmark.sh
-```
-
-## Key Achievements 🏆
-
-Based on actual benchmark results:
-
-✅ **73,304 req/s** peak throughput (wrk, 1000 connections)
-✅ **0.195ms** cache hit latency (L1/L2 hot cache)
-✅ **1.96M+ requests** tested with zero failures
-✅ **10-15x faster** than Node.js SSR (Next.js/Remix)
-✅ **3x faster** than Go SSR implementations
-✅ **99.4% thread efficiency** under load
-✅ **6.3 billion requests/day** capacity on MacBook
-✅ **Linear scaling** up to 1000+ concurrent connections
-✅ **$54k/year savings** vs Next.js on AWS
-
-## Technical Highlights
-
-**Architecture:**
-- Multi-tier cache: L1/L2 (thread-local) → RAM (DashMap)
-- V8 Thread Pool: 10 workers (= CPU cores)
-- Cache-line aligned: `#[repr(align(64))]` for L1 cache efficiency
-- Zero-copy: `Arc<str>` shared references
-- LRU eviction: Atomic counter-based strategy
-- Lock-free: DashMap for concurrent cold cache access
-
-**Performance optimizations:**
-- Thread-local hot cache (512 bytes, fits in L1)
-- Auto-promotion: Cold → Hot on access
-- Fixed thread pool (no adaptive overhead)
-- Brotli quality 4 (speed/size balance)
-- Rust + Tokio (no GC pauses)
-
-## Real-World Use Cases
-
-### E-Commerce Platform
-```
-Traffic: 1M users/day → ~5M requests/day
-Your server: 6.3B capacity (1,260x headroom)
-Cost: $30/month (t3.medium)
-Status: Massive overkill ✅
-```
-
-### News Website
-```
-Viral article: 50k concurrent users → 10k req/s
-Your server: 73k req/s capacity (7x headroom)
-Cost: $120/month (c6g.xlarge)
-Status: Easy to handle ✅
-```
-
-### SaaS Dashboard
-```
-Enterprise: 10k users → 2k req/s peak
-Your server: 73k req/s capacity (36x headroom)
-Cost: $30/month (t3.medium)
-Status: Single server is enough ✅
-```
-
-## Contact
-
-For questions about benchmark results or performance optimization, open an issue.
-
----
-
-**Last updated**: 2025-10-12 (Actual benchmark results from MacBook Pro M1/M2)
-**Server version**: 0.1.0
-**Rust version**: 1.83+
-**Peak tested**: 73,304 req/s (wrk, 1000 connections)
-**Total requests tested**: 1,960,000+ (100% success rate)
+`engine.pool_metrics()` reports saturation, queue depth and render percentiles
+while a run is in flight — worth checking, so that a benchmark can be shown to
+have reached saturation rather than assumed to have.
+
+## What is not measured here
+
+- **Clustered Node.** The nine-process figure is linear extrapolation, which
+  flatters Node's contention; only the memory comparison is measured.
+- **Linux for the synthetic rows.** Node's HTTP stack is weaker on Windows, so
+  the gap there is probably narrower on Linux.
+- **Any cloud instance.** There are no projections in this file, and the AWS
+  cost tables that used to be here were built on numbers that never rendered a
+  page.
+- **Streaming.** This crate returns a whole document; nothing here says anything
+  about time-to-first-byte under a streaming renderer.

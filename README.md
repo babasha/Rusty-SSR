@@ -1,38 +1,53 @@
 # Rusty SSR
 
-**The fastest SSR engine for Rust. Period.**
+**Server-side rendering inside your Rust binary — no Node sidecar, one shared cache, bounded memory.**
 
-Render 95,000+ pages per second with sub-millisecond latency. Drop-in replacement for Node.js SSR that's 50x faster.
+Runs your framework's SSR bundle in a pool of V8 isolates in the same process that serves the request. Renders at the speed Node does, in about a tenth of the memory, with request isolation and a cache every worker shares.
 
 [![Crates.io](https://img.shields.io/crates/v/rusty-ssr.svg)](https://crates.io/crates/rusty-ssr)
 [![Documentation](https://docs.rs/rusty-ssr/badge.svg)](https://docs.rs/rusty-ssr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Benchmarks (Apple M4, 10 cores)
+## What it actually does, measured
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    STRESS TEST (30 seconds)                 │
-├─────────────────────────────────────────────────────────────┤
-│  Requests/sec:      95,363 RPS                              │
-│  Total requests:    2,869,878                               │
-│  Data transferred:  171 GB                                  │
-├─────────────────────────────────────────────────────────────┤
-│  Latency p50:       0.46ms                                  │
-│  Latency p99:       4.60ms                                  │
-│  Max latency:       45.7ms                                  │
-└─────────────────────────────────────────────────────────────┘
-```
+Two numbers decide what an SSR service can serve, they differ by fifty times, and quoting one without the other says nothing. From a real application — a 2.5 MB Preact bundle producing 200–320 kB pages with database queries behind them, on an 8-core Ryzen 7 260, Linux:
 
-### vs Competition
+| | pages/s | p50 | p99 |
+|---|---|---|---|
+| Served from the page cache | 48,029 | 1.04 ms | 5.61 ms |
+| **Actually rendered** | **950** | 17.1 ms | 31.2 ms |
 
-| Engine | RPS | p99 Latency | Memory |
-|--------|-----|-------------|--------|
-| **Rusty SSR** | **95,363** | **4.6ms** | ~200MB |
-| Next.js (Node) | 500-2,000 | 50-200ms | ~500MB+ |
-| Nuxt (Node) | 500-1,500 | 40-150ms | ~500MB+ |
+**The second row is the one that sizes a deployment.** A pool serves at most `pool_size / render_time` — 16 workers at 16.8 ms each — and throughput stops rising the moment every worker is busy. Going from 16 to 128 concurrent callers bought 9% more throughput and made p50 seven times worse.
 
-**50x faster throughput. 40x lower latency. 60% less memory.**
+So plan with `requests/s ≤ 950 / (1 − hit_rate)`:
+
+| cache hit rate | sustained req/s |
+|---|---|
+| 90% | ~9,500 |
+| 95% | ~19,000 |
+| 99% | ~95,000 |
+
+Memory for that configuration was **1.7 GB** at `pool_size = 16` — roughly 70 MB per isolate, reached within seconds and then flat. Cap it with [`max_heap_mb`](#memory-cap) and size `pool_size` deliberately; see [Sizing the pool](#sizing-the-pool).
+
+## How it compares
+
+Rendering is V8 executing your bundle, and that is the same V8 Node embeds. Measured on one machine, same page, same bundle where the bundle is shared:
+
+| | pages/s | note |
+|---|---|---|
+| rusty-ssr, `pool_size=16` | 18,475 | one process |
+| rusty-ssr, `pool_size=1` | 2,421 | one render thread |
+| Node + the same Preact bundle | 2,250 | one render thread |
+| Node + React `renderToString` | 2,206 | one render thread |
+| Next.js 15 App Router (RSC) | 125 | one process |
+
+Read that honestly:
+
+- **Per render thread this engine is at parity with Node** (2,421 vs 2,250 — about 1.1×). There is no version of this that runs JavaScript faster than Node, because it is the same engine running the same bytecode.
+- **React and Preact render at the same speed.** 2,206 vs 2,250. The gap to Next.js is not "React is slow" — it is the App Router's RSC pipeline and its 77 kB hydration payload against 24 kB of markup, on a page Next renders in ~10 ms.
+- **The whole advantage is the first row**: 7.6× from running 16 isolates in one process. Matching it with Node means about nine processes, each with its own heap, its own compiled copy of the bundle, and its own fragmented cache.
+
+Caveats that belong with those numbers: 24 kB page, load generator on the same machine, Windows for the synthetic rows and Linux for the application ones, Next.js measured in App Router mode (its slowest). Full method and raw output in [BENCHMARK.md](BENCHMARK.md).
 
 ## Why Rusty SSR?
 
@@ -48,24 +63,25 @@ Node.js Cluster Mode          Rusty SSR
 │  └─ V8 + 512MB heap │       │  ├─ ...             │
 ├─────────────────────┤       │  └─ V8 isolate 10   │
 │ ... × 10            │       │                     │
-├─────────────────────┤       │  Shared L1/L2 Cache │
-│ ~5GB RAM total      │       │  ~200MB RAM total   │
+├─────────────────────┤       │  One shared cache   │
+│ ~5GB RAM total      │       │  ~1.7GB RAM total   │
 │ No shared cache     │       │  Zero-copy Arc<str> │
 └─────────────────────┘       └─────────────────────┘
 ```
 
-- **Node.js**: 10 processes × 512MB = 5GB RAM, no shared cache
-- **Rusty SSR**: 1 process, 10 V8 isolates, shared cache, 200MB RAM
+This is the argument for the crate, and it is the part the measurements support. Isolates are not free — about 70 MB each with a 2.5 MB bundle, so sixteen of them is 1.7 GB — but they are far cheaper than processes, and only one of them holds the cache.
+
+The cache being shared is worth as much as the memory. Nine Node processes have nine caches, so a 90%-hit workload fragments into nine partial ones; the equivalent here is one cache all sixteen workers read. Getting that across processes means Redis, and a network hop is four orders of magnitude slower than the lookup it replaces.
 
 ### The Solution
 
-Rusty SSR runs V8 isolates in a thread pool managed by Rust. Each CPU core gets its own V8 instance, but they share a common cache. Zero-copy `Arc<str>` means no memory duplication.
+Rusty SSR runs V8 isolates in a thread pool managed by Rust. Each worker gets its own V8 instance, they share one cache and one copy of the bundle, and `Arc<str>` means a cache hit hands back a refcount bump rather than a copy of the page.
 
 ## Quick Start
 
 ```toml
 [dependencies]
-rusty-ssr = "0.1"
+rusty-ssr = "0.3"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 ```
@@ -126,7 +142,7 @@ async fn ssr_handler(
 }
 ```
 
-That's it. Your SSR is now 50x faster.
+That is it — SSR now happens inside your Rust binary, with no Node process to deploy, supervise or pay for.
 
 ## Features
 
@@ -140,19 +156,33 @@ No more "window is not defined" errors. Rusty SSR automatically injects polyfill
 - `MutationObserver`, `ResizeObserver`, `IntersectionObserver`
 - `matchMedia`, `Image`, `performance`
 
-Just load your bundle — it works.
+Also `URL`/`URLSearchParams`, `atob`/`btoa`, `fetch` (which throws), timers that
+defer to a microtask, and a per-request boundary that resets what a render left
+behind.
+
+Not provided: `TextEncoder`/`TextDecoder` and `MessageChannel`. React needs
+both at module scope — see [React needs `TextEncoder` and
+`MessageChannel`](#react-needs-textencoder-and-messagechannel). Write the exact
+prelude out with `rusty-ssr-check --dump-prelude` rather than guessing at it.
 
 ### Multi-tier Cache
 
 ```
-Request → L1/L2 Hot Cache (1-3ns) → Cold Cache (100ns) → V8 Render
-               ↑                          ↑                  ↓
-               └──────────────────────────┴──── cache result ┘
+Request → Hot Cache (thread-local) → Cold Cache (sharded) → V8 Render
+               ↑                          ↑                     ↓
+               └──────────────────────────┴──── cache result ────┘
 ```
 
-- **Hot cache**: Thread-local, L1/L2 CPU cache speed
-- **Cold cache**: DashMap with LRU eviction
-- **Automatic**: No configuration needed
+- **Hot cache**: thread-local, 8 entries in an array plus a 128-entry LRU
+- **Cold cache**: `DashMap` across 128 shards, LRU eviction, shared by every worker
+- **Automatic**: no configuration needed
+
+A hit measures **42–69 ns** end to end through `SsrCache`, a miss ~34–52 ns.
+Those are criterion figures and the range is the machine, not the code: run the
+same unchanged build twice and criterion will report a 32% "improvement", so
+treat anything under about a third as noise. Sharing one cache across all
+workers matters far more than the tiering inside it does — against a render at
+17 ms, the difference between a 40 ns lookup and a 400 ns one is not visible.
 
 That tier caches the **fragment** the render returned. Above it sits the page
 cache, which caches the **response**.
@@ -209,13 +239,47 @@ without storing it, for when the data can change independently of the URL.
 
 Works with any JavaScript framework that supports SSR:
 
-- **React** / **Preact**
+- **Preact** — renders as-is, nothing extra needed.
+- **React** — needs two globals the prelude does not ship; see below.
 - **Vue 3** / **Nuxt**
 - **Solid**
 - **Svelte** / **SvelteKit**
 - **Vanilla JS**
 
 See `examples/bundles/` for complete examples.
+
+#### React needs `TextEncoder` and `MessageChannel`
+
+`react-dom/server` reaches for both at module scope, so a React bundle fails to
+*load* — not to render — with `ReferenceError: MessageChannel is not defined`.
+The prelude leaves `TextEncoder` out deliberately (a wrong UTF-8 implementation
+is worse than an absent one), and that reasoning does not survive contact with
+React, which does not feature-detect.
+
+Until the prelude ships them, prepend your own. A correct minimal pair is about
+forty lines: a `MessageChannel` whose ports deliver through `Promise.resolve()`,
+and a `TextEncoder`/`TextDecoder` that handles surrogate pairs. React measured
+at the same speed as Preact here once they were in place.
+
+### Sizing the pool
+
+`pool_size` is the ceiling: the engine serves at most `pool_size / render_time`
+pages per second, and every worker costs memory whether it is busy or not.
+
+- **Memory.** About 36 MB per isolate, plus roughly four times your bundle's
+  size again per isolate for compiled code — a 2.5 MB bundle measured ~70 MB per
+  worker, so `pool_size = 16` was 1.7 GB. Cap each isolate with
+  [`max_heap_mb`](#memory-cap) so a runaway render fails instead of growing.
+- **`num_cpus::get()` is the wrong default in a container.** It reads CPU
+  affinity, not the CFS quota, so on a host with 32 cores it returns 32 however
+  small your container's share is. Take `pool_size` from your platform's own
+  variable instead.
+- **More workers than physical cores buys little.** Measured on 8 physical
+  cores: 8 workers gave 5.1× one worker's throughput, 16 gave 6.2×, and past
+  ~1.5× the core count p99 degrades sharply while p50 barely improves.
+- **Watch, don't guess.** `engine.pool_metrics()` reports `saturation`,
+  `queue_pressure` and render percentiles. Saturation pinned at 100% with a
+  filling queue means the pool is the bottleneck; nothing else will tell you.
 
 ## API Reference
 
@@ -490,7 +554,7 @@ cargo bench --bench cache_benchmark
 **Cache Benchmarks** (`cache_benchmark`):
 - DashMap concurrent read/write (1, 2, 4, 8 threads)
 - DashMap sharding (sequential vs random keys)
-- L1/L2 cache hit performance
+- Hot-tier vs cold-tier hit performance
 - LRU eviction overhead (128, 512, 2048 entries)
 - Arc<str> vs String cloning
 

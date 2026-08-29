@@ -1,4 +1,12 @@
-# 🏆 Benchmark Results Summary
+# Benchmark Results — October 2025 (historical)
+
+> **What this measured.** A real `wrk` run against an HTTP server on an M1/M2
+> MacBook, serving pages **out of the cache**. The 73,304 req/s below is a
+> cached-response figure: nothing was rendered to produce it. It is kept as a
+> record of an actual run, not as a capacity number.
+>
+> For what the engine can *build* — the figure that sizes a deployment — and for
+> a measured comparison against Node and Next.js, see [BENCHMARK.md](BENCHMARK.md).
 
 **Date:** 2025-10-12
 **Hardware:** MacBook Pro M1/M2 (10 cores, 16GB RAM)
@@ -54,42 +62,17 @@ Success Rate:      100%
 
 ---
 
-## 📈 Performance vs Industry
+## What this run showed
 
-| Framework | Throughput | Multiplier |
-|-----------|-----------|------------|
-| This Server | 73,304 req/s | **1.0x** 🏆 |
-| NGINX (static) | ~50,000 req/s | 0.68x |
-| Go SSR | ~25,000 req/s | 0.34x |
-| Fresh (Deno) | ~12,000 req/s | 0.16x |
-| Remix | ~6,000 req/s | 0.08x |
-| Next.js | ~5,000 req/s | 0.07x |
-
-**Result: 10-15x faster than Node.js, 3x faster than Go!**
-
----
-
-## 💰 Cost Efficiency (AWS)
-
-### 5 Billion requests/day
-
-| Solution | Servers | Monthly Cost | Annual Savings |
-|----------|---------|--------------|----------------|
-| **This Server** | 1× c6gn.16xlarge | **$1,500** | Baseline |
-| Next.js | 100× t3.xlarge | $6,000 | **-$54,000** |
-| Vercel | Managed | $2,400 | **-$10,800** |
-
----
-
-## 🎯 Key Achievements
-
-✅ 73,304 req/s peak throughput
-✅ 0.195ms cache hit latency
+✅ 73,304 cached responses/s at peak
+✅ 0.195 ms per cached response, end to end over HTTP
 ✅ 1.96M+ requests with zero failures
-✅ 99.4% thread efficiency
 ✅ Linear scaling to 1000 connections
-✅ 10-15x faster than Node.js SSR
-✅ $54k/year cost savings vs Next.js
+
+The comparison table and AWS cost projections that used to sit here were
+estimates — competitor figures carried a `~`, no method and no hardware, and
+they were set against this cached number rather than against a render. They are
+removed rather than patched; [BENCHMARK.md](BENCHMARK.md) has measured ones.
 
 ---
 

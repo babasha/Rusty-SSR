@@ -86,8 +86,8 @@ async fn main() {
     let app = Arc::new(App { engine, payload });
 
     let router = Router::new()
-        .route("/render/{id}", get(render_uncached))
-        .route("/cached/{id}", get(render_cached))
+        .route("/render/:id", get(render_uncached))
+        .route("/cached/:id", get(render_cached))
         .route("/metrics", get(metrics))
         .with_state(app);
 
