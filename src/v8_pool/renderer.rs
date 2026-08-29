@@ -72,7 +72,12 @@ impl RenderPayload {
     }
 }
 
-/// Call `globalThis.__rustySsrReset()`, the per-request boundary.
+/// Call `globalThis.__rustySsrReset(url)`, the per-request boundary.
+///
+/// The URL goes with it because the boundary is also where `location` is set
+/// for the request about to run: the engine is the only thing that knows the
+/// URL, and a router reading `location.pathname` is how most applications
+/// decide what to render.
 ///
 /// Resolved once per worker and then cached, including the "there isn't one"
 /// answer — a bundle loaded with `.polyfills(false)` and no hook of its own is
@@ -82,7 +87,7 @@ impl RenderPayload {
 /// A throw propagates. Serving a request whose isolation failed means serving
 /// it with the previous request's state still in place, and the previous
 /// request belonged to somebody else.
-fn reset_request_state(state: &mut RuntimeState) -> Result<(), String> {
+fn reset_request_state(url: &str, state: &mut RuntimeState) -> Result<(), String> {
     if state.reset_fn.is_none() {
         let resolved = state
             .runtime
@@ -104,8 +109,12 @@ fn reset_request_state(state: &mut RuntimeState) -> Result<(), String> {
     let scope = &mut state.runtime.handle_scope();
     let func = v8::Local::new(scope, reset_global);
     let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
+    let url_v8: v8::Local<v8::Value> = match v8::String::new(scope, url) {
+        Some(s) => s.into(),
+        None => return Err("URL too long for a V8 string".to_string()),
+    };
     let tc = &mut v8::TryCatch::new(scope);
-    if func.call(tc, recv, &[]).is_none() {
+    if func.call(tc, recv, &[url_v8]).is_none() {
         let msg = tc
             .exception()
             .map(|e| e.to_rust_string_lossy(tc))
@@ -164,7 +173,7 @@ pub fn render_html(
 
     // Draw the request boundary before anything else runs. See the prelude's
     // `__rustySsrReset` for why a pooled isolate needs one.
-    reset_request_state(state)?;
+    reset_request_state(url, state)?;
 
     // Resolve and cache the render function once per worker. A small one-off
     // script handles dotted names (e.g. "module.renderPage").

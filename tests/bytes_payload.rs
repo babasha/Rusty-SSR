@@ -175,3 +175,63 @@ async fn an_empty_byte_payload_is_still_a_uint8array() {
         "bytes:0"
     );
 }
+
+/// `atob`/`btoa` are Web APIs, not ECMAScript ones, so bare V8 has neither —
+/// and a bundle that hits a missing `atob` throws, which on this path means an
+/// empty page rather than an error anyone sees.
+#[tokio::test]
+async fn base64_and_screen_are_available_to_the_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("web-apis.js");
+    std::fs::write(
+        &bundle_path,
+        r#"globalThis.renderPage = () => {
+               const round = atob(btoa("Blumenau · SC"));
+               return [
+                   round,
+                   atob("Zm9vYmFy"),
+                   btoa("foobar"),
+                   String(globalThis.devicePixelRatio),
+                   String(globalThis.screen.width) + "x" + String(globalThis.screen.height),
+                   String(globalThis.screen.deviceXDPI),
+               ].join("|");
+           };"#,
+    )
+    .unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .build_engine()
+        .unwrap();
+
+    assert_eq!(
+        engine.render_uncached("/", "{}").await.unwrap(),
+        "Blumenau · SC|foobar|Zm9vYmFy|1|0x0|96"
+    );
+}
+
+/// Invalid base64 throws rather than returning quiet nonsense — a decoder that
+/// invents bytes is worse than one that stops.
+#[tokio::test]
+async fn atob_refuses_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("bad-b64.js");
+    std::fs::write(
+        &bundle_path,
+        r#"globalThis.renderPage = () => {
+               try { atob("not!base64"); return "accepted junk"; }
+               catch (e) { return "refused: " + e.message; }
+           };"#,
+    )
+    .unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .build_engine()
+        .unwrap();
+
+    let out = engine.render_uncached("/", "{}").await.unwrap();
+    assert!(out.starts_with("refused:"), "got: {out}");
+}

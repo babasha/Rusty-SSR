@@ -75,6 +75,46 @@ pub struct SsrConfig {
     /// (effectively unbounded).
     pub max_heap_mb: Option<usize>,
 
+    /// Delete globals the bundle did not have at startup, before every render
+    /// (default: false)
+    ///
+    /// The pooled isolate's `globalThis` outlives a render, so whatever one
+    /// request hangs on it is readable by the next — which is a different
+    /// person. `onSsrRequest` lets a bundle clear its own state, but only a
+    /// bundle that knows to define it; the code that actually leaks is usually
+    /// a dependency that does not. This closes that half without asking the
+    /// bundle for anything: the engine records `globalThis`'s own property
+    /// names once the bundle has loaded, and every render starts by removing
+    /// anything added since.
+    ///
+    /// Off by default because it is right for correctness and wrong for a
+    /// bundle that caches across renders on purpose — a compiled-template
+    /// cache, a warmed lookup table. Those are legitimate, so this is the
+    /// caller's decision.
+    ///
+    /// It does not reach state held in module closures; nothing outside the
+    /// bundle can. That is what `onSsrRequest` is for, and the two compose.
+    pub seal_globals: bool,
+
+    /// Refuse a render that produced fewer than this many bytes (default: none)
+    ///
+    /// An empty render is the SSR failure that does not announce itself. Every
+    /// real bundle wraps its render in a `try/catch` — frameworks throw for
+    /// ordinary reasons, a suspended component being the usual one — and the
+    /// catch returns `""`. The engine cannot tell that from a page whose
+    /// content is legitimately nothing, so by default it hands the empty string
+    /// back and the caller serves a blank page under a 200.
+    ///
+    /// Set this to the smallest body you would ever call a real page and a
+    /// blank render becomes an `Err` the caller can fall back from — to a
+    /// client-rendered shell, usually, which is a far better answer than an
+    /// empty one. A few hundred bytes is a sensible floor: enough to catch
+    /// `""` and a bare wrapper element, not so much that a genuinely small
+    /// page trips it.
+    ///
+    /// Compared against the *trimmed* length, so whitespace is not content.
+    pub min_render_bytes: Option<usize>,
+
     /// Optional cache-key normalizer applied to the URL before lookup/insert
     ///
     /// Return a canonical key so URLs that render identically share one cache
@@ -113,6 +153,8 @@ impl Default for SsrConfig {
             polyfills: true,
             cache_empty: true,
             max_heap_mb: None,
+            min_render_bytes: None,
+            seal_globals: false,
             cache_key_normalizer: None,
             #[cfg(feature = "cache")]
             page_cache: crate::cache::CachePolicy::default(),
@@ -143,6 +185,8 @@ pub struct SsrConfigBuilder {
     polyfills: Option<bool>,
     cache_empty: Option<bool>,
     max_heap_mb: Option<usize>,
+    min_render_bytes: Option<usize>,
+    seal_globals: Option<bool>,
     cache_key_normalizer: Option<fn(&str) -> String>,
     #[cfg(feature = "cache")]
     page_cache: Option<crate::cache::CachePolicy>,
@@ -288,6 +332,43 @@ impl SsrConfigBuilder {
     ///
     /// A render exceeding the cap is terminated and returns an error
     /// (uncached) rather than aborting the process. Omit for no limit.
+    /// Delete globals the bundle did not have at startup, before every render.
+    ///
+    /// See [`SsrConfig::seal_globals`]. Turn it on unless your bundle
+    /// deliberately caches something on `globalThis` across renders.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rusty_ssr::SsrConfig;
+    ///
+    /// let config = SsrConfig::builder().seal_globals(true).build();
+    /// ```
+    pub fn seal_globals(mut self, seal: bool) -> Self {
+        self.seal_globals = Some(seal);
+        self
+    }
+
+    /// Treat a render shorter than `bytes` as a failure.
+    ///
+    /// See [`SsrConfig::min_render_bytes`]. Without it, a bundle that swallows
+    /// its own exception and returns `""` produces a blank page served with a
+    /// 200, and nothing anywhere says so.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rusty_ssr::SsrConfig;
+    ///
+    /// let config = SsrConfig::builder().min_render_bytes(200).build();
+    /// ```
+    pub fn min_render_bytes(mut self, bytes: usize) -> Self {
+        self.min_render_bytes = Some(bytes);
+        self
+    }
+
+    /// Set a maximum V8 heap size per worker isolate, in megabytes
+    ///
+    /// A render exceeding the cap is terminated and returns an error
+    /// (uncached) rather than aborting the process. Omit for no limit.
     pub fn max_heap_mb(mut self, mb: usize) -> Self {
         self.max_heap_mb = Some(mb);
         self
@@ -368,6 +449,8 @@ impl SsrConfigBuilder {
             polyfills: self.polyfills.unwrap_or(default.polyfills),
             cache_empty: self.cache_empty.unwrap_or(default.cache_empty),
             max_heap_mb: self.max_heap_mb,
+            min_render_bytes: self.min_render_bytes,
+            seal_globals: self.seal_globals.unwrap_or(default.seal_globals),
             cache_key_normalizer: self.cache_key_normalizer,
             #[cfg(feature = "cache")]
             page_cache: self.page_cache.unwrap_or(default.page_cache),

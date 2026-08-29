@@ -45,6 +45,7 @@ mod pool_config_tests {
             request_timeout: Some(std::time::Duration::from_secs(1)),
             render_function: "customRender".to_string(),
             max_heap_mb: None,
+            seal_globals: false,
             bundle: std::sync::Arc::from(""),
         };
 
@@ -64,6 +65,7 @@ mod pool_config_tests {
             request_timeout: None,
             render_function: "render".to_string(),
             max_heap_mb: None,
+            seal_globals: false,
             bundle: std::sync::Arc::from(""),
         };
 
@@ -95,6 +97,7 @@ mod pool_timeout_tests {
             request_timeout: Some(Duration::from_millis(5)),
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
+            seal_globals: false,
             bundle: std::sync::Arc::from(""),
         });
 

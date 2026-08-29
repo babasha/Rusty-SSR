@@ -66,6 +66,10 @@ pub struct V8PoolConfig {
     /// in one process can render two different applications — and so a test
     /// binary can hold more than one bundle.
     pub bundle: Arc<str>,
+
+    /// Delete globals added since startup before every render. See
+    /// [`SsrConfig::seal_globals`](crate::SsrConfig::seal_globals).
+    pub seal_globals: bool,
 }
 
 impl Default for V8PoolConfig {
@@ -78,6 +82,7 @@ impl Default for V8PoolConfig {
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
             bundle: Arc::from(""),
+            seal_globals: false,
         }
     }
 }
@@ -198,6 +203,7 @@ impl V8Pool {
                 Arc::clone(&pool.next_core),
                 config.max_heap_mb,
                 Arc::clone(&config.bundle),
+                config.seal_globals,
                 watchdog.clone(),
             );
         }
@@ -355,6 +361,7 @@ fn spawn_worker(
     next_core: Arc<AtomicUsize>,
     max_heap_mb: Option<usize>,
     bundle: Arc<str>,
+    seal_globals: bool,
     watchdog: Option<Arc<Watchdog>>,
 ) {
     // Increment worker count
@@ -377,7 +384,7 @@ fn spawn_worker(
         }
 
         // Initialize V8 runtime for this thread (with optional heap cap)
-        if let Err(e) = runtime::init_runtime(&bundle, max_heap_mb) {
+        if let Err(e) = runtime::init_runtime(&bundle, max_heap_mb, seal_globals) {
             tracing::error!("❌ Failed to initialize V8 for worker {}: {}", id, e);
             let mut count = worker_count.lock().unwrap();
             *count -= 1;
@@ -508,6 +515,7 @@ impl V8Pool {
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
             bundle: Arc::from(""),
+            seal_globals: false,
         })
     }
 }

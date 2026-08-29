@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
@@ -20,9 +20,18 @@ categories = ["web-programming", "caching", "asynchronous"]
 name = "rusty_ssr"
 path = "src/lib.rs"
 
+# Run an SSR bundle in the real engine and report what it does — the check every
+# project otherwise writes by hand, against a hand-copied prelude that drifts.
+[[bin]]
+name = "rusty-ssr-check"
+path = "src/bin/rusty-ssr-check.rs"
+required-features = ["v8-pool"]
+
+# Uses axum, which is no longer a default feature — see [features].
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+required-features = ["axum-integration"]
 
 [[example]]
 name = "loadtest"
@@ -36,7 +45,15 @@ codegen-units = 1
 strip = true
 
 [features]
-default = ["v8-pool", "cache", "axum-integration"]
+# The engine and its caches, and nothing else.
+#
+# `axum-integration` used to be on by default, which meant every consumer
+# compiled axum + tower + tower-http whether or not they touched the one
+# middleware behind that flag — and, worse, got a *second* axum in the
+# dependency graph the moment their own axum version moved past ours. An SSR
+# engine has no business pinning anyone's web framework. Opt in with
+# `features = ["axum-integration"]` if you want the brotli middleware.
+default = ["v8-pool", "cache"]
 v8-pool = ["deno_core", "serde_v8"]
 cache = ["dashmap", "parking_lot", "lru", "bytes"]
 axum-integration = ["axum", "tower", "tower-http"]

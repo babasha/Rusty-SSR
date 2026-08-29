@@ -270,6 +270,7 @@ impl SsrEngine {
                 render_function: config.render_function.clone(),
                 max_heap_mb: config.max_heap_mb,
                 bundle,
+                seal_globals: config.seal_globals,
             })
         };
 
@@ -338,7 +339,8 @@ impl SsrEngine {
             .v8_pool
             .render_with_data(url.to_string(), data.to_string())
             .await
-            .map_err(Self::map_pool_error)?;
+            .map_err(Self::map_pool_error)
+            .and_then(|html| self.guard_empty(html))?;
 
         let html: Arc<str> = Arc::from(html.as_str());
 
@@ -466,6 +468,7 @@ impl SsrEngine {
             .render_with_data(url.to_string(), data.to_string())
             .await
             .map_err(Self::map_pool_error)
+            .and_then(|html| self.guard_empty(html))
     }
 
     /// Render without caching, handing the bundle raw bytes.
@@ -501,6 +504,7 @@ impl SsrEngine {
             .render_with_bytes(url.to_string(), data)
             .await
             .map_err(Self::map_pool_error)
+            .and_then(|html| self.guard_empty(html))
     }
 
     /// Render without caching, with a JSON envelope AND a binary payload: the
@@ -540,6 +544,7 @@ impl SsrEngine {
             .render_with_json_and_bytes(url.to_string(), json.to_string(), bytes)
             .await
             .map_err(Self::map_pool_error)
+            .and_then(|html| self.guard_empty(html))
     }
 
     /// Render without caching with JSON data
@@ -582,12 +587,30 @@ impl SsrEngine {
             .v8_pool
             .render_with_data(url.to_string(), data.to_string())
             .await
-            .map_err(Self::map_pool_error)?;
+            .map_err(Self::map_pool_error)
+            .and_then(|html| self.guard_empty(html))?;
 
         match &self.template {
             Some(tmpl) => Ok(tmpl.assemble(&fragment, replacements)),
             None => Ok(fragment),
         }
+    }
+
+    /// Refuse a render that produced (almost) nothing, when the caller has said
+    /// what "nothing" means.
+    ///
+    /// The check is here rather than in the pool because it is a policy, not a
+    /// mechanism: V8 did its job, the bundle returned a string, and whether a
+    /// 12-byte string is a page is a question only the application can answer.
+    #[cfg(feature = "v8-pool")]
+    fn guard_empty(&self, html: String) -> SsrResult<String> {
+        if let Some(min) = self.config.min_render_bytes {
+            let len = html.trim().len();
+            if len < min {
+                return Err(SsrError::EmptyRender(len));
+            }
+        }
+        Ok(html)
     }
 
     /// Apply the configured normalizer to a URL (identity if none set).

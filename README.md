@@ -251,6 +251,32 @@ let html = engine.render_to_html_with_replacements(
 ).await?;
 ```
 
+### What's in 0.3.0
+
+Full notes in [CHANGELOG.md](CHANGELOG.md).
+
+- **`rusty-ssr-check`** — run your bundle in the real engine and find out what
+  it does, instead of in a hand-copied imitation of it:
+  ```text
+  rusty-ssr-check dist/ssr-bundle.js --url / --url /products/42 --min-bytes 200
+  ```
+  Loads it, renders each URL, reports the bytes, and detects state carried
+  between requests. Exit 0 or 1 — put it in your deploy script.
+- **`.seal_globals(true)`** — delete globals the bundle did not have at startup,
+  before every render. The half of request isolation that needs no cooperation
+  from the bundle, which matters because the code that leaks is usually a
+  dependency that never defines a hook.
+- **`.min_render_bytes(n)`** — a render that produced (almost) nothing becomes
+  an error instead of a blank page served with a 200.
+- **`location` from the render URL** — no more writing that assignment by hand
+  before every render, and no more "every URL renders the home page".
+- **`atob` / `btoa` / `screen` / `devicePixelRatio`** in the prelude.
+- **axum is no longer a default feature.** `features = ["axum-integration"]` to
+  opt in.
+
+A fresh V8 context per request was investigated and is not reachable through
+`deno_core` + `rusty_v8` today — the CHANGELOG explains exactly where it stops.
+
 ### What's in 0.2.0
 
 Everything here came out of running 0.1 in production for a season. Full notes

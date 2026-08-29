@@ -81,53 +81,60 @@ ${ssrCode}
  * @returns {string} Complete HTML document
  */
 globalThis.renderPage = async function(url, data) {
-    try {
-        // Parse data if string
-        const props = typeof data === 'string' ? JSON.parse(data) : (data || {});
+    // Parse data if string. rusty-ssr hands over a native object, but a probe
+    // or a hand-written caller might pass JSON text.
+    const props = typeof data === 'string' ? JSON.parse(data) : (data || {});
 
-        // Build context for Preact SSR
-        const context = {
-            url: url,
-            data: props,
-            headers: {},
-            userAgent: 'Rusty-SSR/1.0',
-        };
+    const context = {
+        url: url,
+        data: props,
+        headers: {},
+        userAgent: 'Rusty-SSR/1.0',
+    };
 
-        // Call your SSR render function
-        // Assumes SSRBundle.renderToString returns { html, head?, initialData? }
-        const result = await SSRBundle.renderToString(context);
+    // NO try/catch around this. It is tempting — a render that throws feels
+    // like something to handle — but a catch here can only do one of two
+    // things, and both are worse than letting the throw out:
+    //
+    //   * return an error page. rusty-ssr cannot tell that from a successful
+    //     render, so it caches it and serves it, with your stack trace in the
+    //     body, until the entry expires. This example used to do exactly that.
+    //   * return "". Then the caller drops an empty string into its HTML shell
+    //     and serves a blank page under a 200, and nothing anywhere says so.
+    //
+    // Since 0.1.1 a throw propagates to Rust as an `Err`, which is what you
+    // want: the caller logs it and falls back to a client-rendered shell. If
+    // your framework throws for ordinary reasons — a suspended component, say
+    // — catch *that* specifically and return the shell you want, then set
+    // `.min_render_bytes(...)` so a thin result is still treated as a failure.
+    const result = await SSRBundle.renderToString(context);
 
-        // Build complete HTML document
-        // CUSTOMIZE THIS for your project!
-        const html = \`<!DOCTYPE html>
+    // CUSTOMIZE THIS for your project.
+    return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Preact App</title>
-    \${result.head || ''}
+    ${result.head || ''}
     <!-- Add your CSS links here -->
 </head>
 <body>
-    <div id="app">\${result.html}</div>
-    <script>window.__INITIAL_DATA__ = \${JSON.stringify(result.initialData || props)}</script>
+    <div id="app">${result.html}</div>
+    <script type="application/json" id="initial-data">${
+        // `</script>` inside the data would close this tag early and everything
+        // after it becomes markup — which is script injection if any of the
+        // data came from a user. Escaping `<` is enough to make that
+        // impossible, and JSON keeps its meaning: "<" parses back to "<".
+        //
+        // A `type="application/json"` tag rather than an assignment, so the
+        // browser never executes any of it: read it with
+        // `JSON.parse(document.getElementById('initial-data').textContent)`.
+        JSON.stringify(result.initialData || props).replace(/</g, '\\u003c')
+    }</script>
     <!-- Add your client bundle here -->
 </body>
-</html>\`;
-
-        return html;
-    } catch (error) {
-        console.error('[Preact SSR] Error:', error);
-        // Return error page instead of crashing
-        return \`<!DOCTYPE html>
-<html>
-<head><title>SSR Error</title></head>
-<body>
-    <h1>Server Render Error</h1>
-    <pre>\${error.stack || error.message}</pre>
-</body>
-</html>\`;
-    }
+</html>`;
 };
 
 console.log('[Preact SSR] Bundle loaded and ready');

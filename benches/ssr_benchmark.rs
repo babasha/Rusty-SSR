@@ -31,6 +31,8 @@ fn bench_pool_config(c: &mut Criterion) {
                 request_timeout: Some(Duration::from_secs(30)),
                 render_function: "renderPage".to_string(),
                 max_heap_mb: None,
+                bundle: std::sync::Arc::from(""),
+                seal_globals: false,
             };
             black_box(config)
         })

@@ -20,6 +20,20 @@ pub enum SsrError {
     /// Render timeout
     Timeout,
 
+    /// The render succeeded but produced (almost) nothing.
+    ///
+    /// Its own variant because it is the SSR failure that does not look like
+    /// one. Real bundles wrap their render in a `try/catch` — frameworks throw
+    /// for ordinary reasons, a suspended component being the usual one — and the
+    /// catch returns `""`. Nothing errors, nothing logs, and the engine hands
+    /// back an empty string the caller drops into its HTML shell and serves with
+    /// a 200. The page is blank, the status says it is fine, and the only way
+    /// anyone finds out is a person looking at it.
+    ///
+    /// Raised only when `min_render_bytes` is set. The value is what the render
+    /// actually produced.
+    EmptyRender(usize),
+
     /// Cache error
     Cache(String),
 
@@ -43,6 +57,10 @@ impl fmt::Display for SsrError {
             SsrError::V8Init(msg) => write!(f, "V8 initialization error: {}", msg),
             SsrError::JsExecution(msg) => write!(f, "JavaScript execution error: {}", msg),
             SsrError::Timeout => write!(f, "Render timeout"),
+            SsrError::EmptyRender(bytes) => write!(
+                f,
+                "Render produced {bytes} bytes, below min_render_bytes — treating an empty page as a failure"
+            ),
             SsrError::Cache(msg) => write!(f, "Cache error: {}", msg),
             SsrError::PoolFull => write!(f, "V8 pool is full, request rejected"),
             SsrError::Template(msg) => write!(f, "Template error: {}", msg),

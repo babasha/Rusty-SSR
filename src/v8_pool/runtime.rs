@@ -37,7 +37,11 @@ thread_local! {
 /// `max_heap_mb` caps the isolate's heap. When a render approaches the cap,
 /// its execution is terminated (surfacing as an `Err` that is not cached)
 /// instead of the whole process aborting on OOM.
-pub fn init_runtime(bundle_source: &str, max_heap_mb: Option<usize>) -> Result<(), String> {
+pub fn init_runtime(
+    bundle_source: &str,
+    max_heap_mb: Option<usize>,
+    seal_globals: bool,
+) -> Result<(), String> {
     JS_RUNTIME.with(|slot| {
         let mut slot = slot.borrow_mut();
 
@@ -69,6 +73,22 @@ pub fn init_runtime(bundle_source: &str, max_heap_mb: Option<usize>) -> Result<(
             js_runtime
                 .execute_script("<ssr-bundle>", bundle_source.to_string())
                 .map_err(|e| format!("Failed to load SSR bundle: {}", e))?;
+
+            // Record what `globalThis` holds now — after the bundle's top-level
+            // code has run, before any request has. Everything added past this
+            // point belongs to a request, and `__rustySsrReset` removes it.
+            //
+            // The timing is the whole trick: sealing inside the prelude would
+            // miss every global the bundle itself defines, and sealing on the
+            // first render would keep whatever that render happened to add.
+            if seal_globals {
+                js_runtime
+                    .execute_script(
+                        "<seal-globals>",
+                        "globalThis.__rustySsrSealGlobals && globalThis.__rustySsrSealGlobals()",
+                    )
+                    .map_err(|e| format!("Failed to seal globals: {}", e))?;
+            }
 
             *slot = Some(RuntimeState {
                 runtime: js_runtime,

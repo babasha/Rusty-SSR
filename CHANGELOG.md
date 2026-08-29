@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.3.0
+
+### Request isolation, as far as this stack allows
+
+0.2 gave the pooled isolate a request boundary through `onSsrRequest`, which
+only helps a bundle that knows to define it — and the code that actually leaks
+is usually a dependency that does not. `.seal_globals(true)` closes that half
+without asking the bundle for anything: the engine records the own property
+names of `globalThis` once the bundle has loaded, and every render begins by
+deleting whatever was added since.
+
+Off by default, because "delete every global you did not have at startup" is
+right for correctness and wrong for a bundle that caches across renders on
+purpose — a compiled-template cache, a warmed lookup table. It does not reach
+state held in module closures (nothing outside the bundle can), so it composes
+with `onSsrRequest` rather than replacing it.
+
+**A fresh V8 context per request was investigated and is not reachable through
+this dependency stack.** The cheap way to do it is a context snapshot, and
+`v8::SnapshotCreator::add_context` / `set_default_context` are `pub(crate)` in
+the `v8` crate, while `deno_core`'s `JsRuntime` always enters its main context.
+The alternatives are forking `rusty_v8`, or dropping `deno_core` and driving
+raw V8 — a rewrite of the runtime layer, giving up module loading and promise
+resolution, for a benefit that sealing plus `onSsrRequest` largely already
+deliver. If that changes upstream, this is the note to revisit.
+
+### `location` comes from the render URL
+
+The engine is the only thing that knows the URL, and a router reading
+`location.pathname` is how most applications decide what to render — so every
+consumer was writing that assignment by hand before calling the bundle. Missing
+it is silent: the router sees `/`, every URL renders the home page, and it
+reads as a bug in the application rather than a gap in the harness.
+
+The prelude now sets `pathname`, `search`, `hash` and `href` per request, plus
+`origin`/`protocol`/`host`/`port` when the URL is absolute. Identity-checked, so
+a bundle that installed its own `location` keeps it. `onSsrRequest` receives the
+URL too.
+
+### An empty render can be a failure
+
+`.min_render_bytes(n)` turns a render shorter than `n` (trimmed) into
+`SsrError::EmptyRender`. This is the SSR failure that does not announce itself:
+every real bundle wraps its render in a `try/catch`, the catch returns `""`, and
+the caller serves a blank page under a 200 with nothing anywhere saying so. With
+a floor set the caller gets an `Err` it can fall back from, and the blank result
+is not cached.
+
+### `rusty-ssr-check`
+
+A binary that runs a bundle in the real engine and reports what happens.
+
+```text
+rusty-ssr-check dist/ssr-bundle.js --url / --url /products/42 --min-bytes 200
+rusty-ssr-check --dump-prelude > prelude.js
+```
+
+It checks that the bundle loads, that each URL renders and how many bytes it
+produced, and — by rendering one URL, then another, then the first again —
+whether the bundle carries state between requests. Exit code 0 or 1, so it
+belongs in a deploy script between building the bundle and shipping it.
+
+Every project otherwise writes some version of this as a Node `vm` sandbox with
+the prelude copied into it by hand, and that copy drifts: a drifted probe stays
+green while production serves blank pages.
+
+### `atob`, `btoa`, `screen`, `devicePixelRatio`
+
+Web APIs bare V8 does not have. A bundle that reaches a missing `atob` throws,
+and on this path a throw is an empty page rather than an error anyone sees. For
+payloads prefer `render_with_bytes` — there is nothing to decode at all.
+
+### axum is no longer a default feature
+
+`default = ["v8-pool", "cache"]`. Every consumer used to compile axum + tower +
+tower-http whether or not they touched the single middleware behind that flag,
+and got a *second* axum in their dependency graph as soon as their own version
+moved past ours. An SSR engine has no business pinning anyone's web framework.
+Opt in with `features = ["axum-integration"]`.
+
+### The example no longer teaches two bugs
+
+`examples/build-preact-bundle.js` wrote `window.__INITIAL_DATA__ =
+${JSON.stringify(...)}` unescaped — a `</script>` anywhere in the data ends the
+tag and everything after it becomes markup — and caught render errors to return
+a page containing the stack trace, which the engine cannot distinguish from a
+successful render and therefore caches and serves. Both are gone: the data goes
+into a `type="application/json"` tag with `<` escaped, and the render is not
+wrapped in a catch, with a comment explaining why that is deliberate.
+
+### Breaking changes
+
+- `default` no longer includes `axum-integration`.
+- `V8PoolConfig` gained a required `seal_globals` field.
+- `v8_pool::runtime::init_runtime` takes a `seal_globals` argument.
+- `SsrError` gained an `EmptyRender` variant.
+
 ## 0.2.0
 
 Everything here came out of running 0.1 in production for a season. The theme

@@ -180,6 +180,61 @@ if (typeof globalThis.document === 'undefined') globalThis.document = {
     title: ''
 };
 
+// base64. Web APIs, not ECMAScript ones, so bare V8 has neither — and a bundle
+// that hits a missing `atob` throws, which on this path means an empty page
+// rather than an error anyone sees. Prefer `render_with_bytes` for payloads;
+// these are for the code that has base64 in it for its own reasons (a JWT
+// payload, a data: URL, a stored blob).
+const __RUSTY_B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+if (typeof globalThis.atob === 'undefined') {
+    globalThis.atob = function (input) {
+        const s = String(input).replace(/[\t\n\f\r ]+/g, '').replace(/=+$/, '');
+        if (s.length % 4 === 1) throw new Error('atob: invalid base64 length');
+        const out = [];
+        let bits = 0, acc = 0;
+        for (let i = 0; i < s.length; i++) {
+            const idx = __RUSTY_B64.indexOf(s.charAt(i));
+            if (idx < 0) throw new Error('atob: invalid base64');
+            acc = (acc << 6) | idx;
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out.push(String.fromCharCode((acc >> bits) & 0xff));
+            }
+        }
+        return out.join('');
+    };
+}
+if (typeof globalThis.btoa === 'undefined') {
+    globalThis.btoa = function (input) {
+        const s = String(input);
+        let out = '';
+        for (let i = 0; i < s.length; i += 3) {
+            const c0 = s.charCodeAt(i);
+            const c1 = i + 1 < s.length ? s.charCodeAt(i + 1) : NaN;
+            const c2 = i + 2 < s.length ? s.charCodeAt(i + 2) : NaN;
+            if (c0 > 0xff || c1 > 0xff || c2 > 0xff) throw new Error('btoa: byte out of range');
+            out += __RUSTY_B64[c0 >> 2];
+            out += __RUSTY_B64[((c0 & 3) << 4) | (Number.isNaN(c1) ? 0 : c1 >> 4)];
+            out += Number.isNaN(c1) ? '=' : __RUSTY_B64[((c1 & 15) << 2) | (Number.isNaN(c2) ? 0 : c2 >> 6)];
+            out += Number.isNaN(c2) ? '=' : __RUSTY_B64[c2 & 63];
+        }
+        return out;
+    };
+}
+
+// Screen metrics. Zero dimensions because there is no screen; the DPI numbers
+// are the CSS defaults rather than zeros, since code that divides by them is
+// commoner than code that reads them.
+if (typeof globalThis.screen === 'undefined') globalThis.screen = {
+    width: 0, height: 0, availWidth: 0, availHeight: 0,
+    colorDepth: 24, pixelDepth: 24,
+    deviceXDPI: 96, deviceYDPI: 96, logicalXDPI: 96, logicalYDPI: 96,
+    orientation: { type: 'portrait-primary', angle: 0 }
+};
+// 1, so retina detection takes the low-DPI branch rather than dividing by zero.
+if (typeof globalThis.devicePixelRatio === 'undefined') globalThis.devicePixelRatio = 1;
+
 // Navigator mock
 if (typeof globalThis.navigator === 'undefined') globalThis.navigator = {
     userAgent: 'Rusty-SSR/1.0',
@@ -189,18 +244,42 @@ if (typeof globalThis.navigator === 'undefined') globalThis.navigator = {
     onLine: true
 };
 
-// Location mock
-if (typeof globalThis.location === 'undefined') globalThis.location = {
-    href: 'http://localhost/',
-    origin: 'http://localhost',
-    protocol: 'http:',
-    host: 'localhost',
-    hostname: 'localhost',
-    port: '',
-    pathname: '/',
-    search: '',
-    hash: ''
-};
+// Location mock. Populated from the render URL before every render — see
+// __rustySsrReset — because a router that reads location.pathname is the normal
+// way an app decides which screen it is on, and leaving this at "/" means every
+// SSR render is the home page whatever URL was asked for.
+let __rustyLocation = null;
+if (typeof globalThis.location === 'undefined') {
+    __rustyLocation = {
+        href: 'http://localhost/',
+        origin: 'http://localhost',
+        protocol: 'http:',
+        host: 'localhost',
+        hostname: 'localhost',
+        port: '',
+        pathname: '/',
+        search: '',
+        hash: ''
+    };
+    globalThis.location = __rustyLocation;
+}
+
+// Split a render URL into location parts. Accepts what the engine passes —
+// "/venda/blumenau?quartos=2#top" — and tolerates an absolute URL, whose
+// protocol/host then replace the placeholder ones.
+function __rustyParseUrl(url) {
+    const m = /^(?:([a-zA-Z][a-zA-Z0-9+.-]*:)\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(
+        String(url),
+    ) || [];
+    const protocol = m[1] || '';
+    const host = m[2] || '';
+    return {
+        protocol, host,
+        pathname: m[3] || '/',
+        search: m[4] || '',
+        hash: m[5] || '',
+    };
+}
 
 // Animation frame mocks
 if (typeof globalThis.requestAnimationFrame === 'undefined') {
@@ -397,7 +476,36 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 //
 // A throw here fails the render rather than being swallowed: a request that
 // could not be isolated must not be served with someone else's state in it.
-globalThis.__rustySsrReset = function () {
+// Everything on globalThis the moment the bundle finished loading. Filled in by
+// __rustySsrSealGlobals, which the engine calls after loading the bundle and
+// only when `.seal_globals(true)` was set. Null means the feature is off and
+// the loop in the reset below does not run.
+let __rustySealedGlobals = null;
+globalThis.__rustySsrSealGlobals = function () {
+    __rustySealedGlobals = new Set(Object.getOwnPropertyNames(globalThis));
+};
+
+globalThis.__rustySsrReset = function (url) {
+    // Anything the last render hung on globalThis goes. This is the half of
+    // request isolation that needs no cooperation from the bundle: `onSsrRequest`
+    // only helps a bundle that knows to define it, and the code that leaks is
+    // usually a dependency that does not.
+    //
+    // Off by default, because "delete every global you did not have at startup"
+    // is right for correctness and wrong for a bundle that deliberately caches
+    // across renders — a compiled-template cache, a warmed lookup table. Those
+    // are legitimate, so opting in is the caller's decision, not ours.
+    if (__rustySealedGlobals !== null) {
+        const names = Object.getOwnPropertyNames(globalThis);
+        for (let i = 0; i < names.length; i++) {
+            if (__rustySealedGlobals.has(names[i])) continue;
+            // Non-configurable properties cannot be deleted; skipping them is
+            // the only option and is better than throwing, which would fail a
+            // render over a global somebody froze.
+            try { delete globalThis[names[i]]; } catch (_e) { /* not configurable */ }
+        }
+    }
+
     if (__rustyLocalStorage !== null && globalThis.localStorage === __rustyLocalStorage) {
         __rustyLocalStorage = createStorage();
         globalThis.localStorage = __rustyLocalStorage;
@@ -406,7 +514,36 @@ globalThis.__rustySsrReset = function () {
         __rustySessionStorage = createStorage();
         globalThis.sessionStorage = __rustySessionStorage;
     }
-    if (typeof globalThis.onSsrRequest === 'function') globalThis.onSsrRequest();
+
+    // `location` for THIS request. Every consumer used to write this by hand
+    // before rendering, because the engine knows the URL and the bundle needs
+    // it in the one global a router reads — a gap that is silent when you miss
+    // it: the router sees "/" and every URL renders the home page, which looks
+    // like a routing bug in the app rather than a missing line in the harness.
+    //
+    // Identity-checked like the storage above: a bundle that installed its own
+    // location object has said it manages this itself.
+    if (typeof url === 'string' && __rustyLocation !== null
+        && globalThis.location === __rustyLocation) {
+        const parts = __rustyParseUrl(url);
+        __rustyLocation.pathname = parts.pathname;
+        __rustyLocation.search = parts.search;
+        __rustyLocation.hash = parts.hash;
+        if (parts.protocol && parts.host) {
+            __rustyLocation.protocol = parts.protocol;
+            __rustyLocation.host = parts.host;
+            __rustyLocation.hostname = parts.host.replace(/:\d+$/, '');
+            __rustyLocation.port = (parts.host.match(/:(\d+)$/) || [])[1] || '';
+            __rustyLocation.origin = parts.protocol + '//' + parts.host;
+        }
+        __rustyLocation.href =
+            __rustyLocation.origin + parts.pathname + parts.search + parts.hash;
+    }
+
+    // The bundle's own state is beyond our reach; this is where it clears it.
+    // The URL is passed along because a bundle that keys anything per-request
+    // usually wants it.
+    if (typeof globalThis.onSsrRequest === 'function') globalThis.onSsrRequest(url);
 };
 
 "#;

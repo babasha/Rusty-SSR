@@ -172,3 +172,145 @@ async fn a_bundle_without_the_prelude_still_renders() {
     assert_eq!(engine.render_uncached("/x", "{}").await.unwrap(), "bare:/x");
     assert_eq!(engine.render_uncached("/y", "{}").await.unwrap(), "bare:/y");
 }
+
+/// `location` is set from the render URL before every render.
+///
+/// Every consumer used to write this by hand, because the engine is the only
+/// thing that knows the URL and a router reading `location.pathname` is how
+/// most applications decide what to render. Getting it wrong is silent: the
+/// router sees "/" and every URL renders the home page, which reads as a bug in
+/// the app rather than a missing line in the harness.
+const LOCATION_BUNDLE: &str = r#"
+    globalThis.renderPage = function(url) {
+        const l = globalThis.location;
+        return [l.pathname, l.search, l.hash, l.href].join("|");
+    };
+"#;
+
+#[tokio::test]
+async fn location_comes_from_the_render_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("location.js");
+    std::fs::write(&bundle_path, LOCATION_BUNDLE).unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .build_engine()
+        .unwrap();
+
+    assert_eq!(
+        engine.render_uncached("/venda/blumenau?quartos=2#mapa", "{}").await.unwrap(),
+        "/venda/blumenau|?quartos=2|#mapa|http://localhost/venda/blumenau?quartos=2#mapa"
+    );
+
+    // And it is per request, not sticky: the next render must not inherit the
+    // previous URL's query.
+    assert_eq!(
+        engine.render_uncached("/sobre", "{}").await.unwrap(),
+        "/sobre|||http://localhost/sobre"
+    );
+}
+
+/// An absolute URL brings its own origin with it.
+#[tokio::test]
+async fn an_absolute_url_sets_the_origin_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("origin.js");
+    std::fs::write(
+        &bundle_path,
+        r#"globalThis.renderPage = () => {
+               const l = globalThis.location;
+               return [l.origin, l.protocol, l.host, l.hostname, l.port, l.pathname].join("|");
+           };"#,
+    )
+    .unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .build_engine()
+        .unwrap();
+
+    assert_eq!(
+        engine.render_uncached("https://morada.test:8443/venda", "{}").await.unwrap(),
+        "https://morada.test:8443|https:|morada.test:8443|morada.test|8443|/venda"
+    );
+}
+
+/// `seal_globals` removes what a render hung on `globalThis`, without the
+/// bundle having to know anything about it. This is the half `onSsrRequest`
+/// cannot cover: the code that leaks is usually a dependency that never
+/// defines a hook.
+const LEAKY_BUNDLE: &str = r#"
+    globalThis.renderPage = function(url) {
+        const inherited = globalThis.__leftBehind || "nothing";
+        globalThis.__leftBehind = url;
+        return inherited;
+    };
+"#;
+
+#[tokio::test]
+async fn sealed_globals_do_not_survive_a_render() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("leaky.js");
+    std::fs::write(&bundle_path, LEAKY_BUNDLE).unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .seal_globals(true)
+        .build_engine()
+        .unwrap();
+
+    assert_eq!(engine.render_uncached("/visitor-a", "{}").await.unwrap(), "nothing");
+    assert_eq!(
+        engine.render_uncached("/visitor-b", "{}").await.unwrap(),
+        "nothing",
+        "visitor B read what visitor A left on globalThis"
+    );
+}
+
+/// Off by default, and the default has to keep working — a bundle that caches
+/// on `globalThis` on purpose is doing something legitimate, and turning this
+/// on for everyone would break it silently.
+#[tokio::test]
+async fn without_sealing_a_global_survives_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("unsealed.js");
+    std::fs::write(&bundle_path, LEAKY_BUNDLE).unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .build_engine()
+        .unwrap();
+
+    assert_eq!(engine.render_uncached("/a", "{}").await.unwrap(), "nothing");
+    assert_eq!(engine.render_uncached("/b", "{}").await.unwrap(), "/a");
+}
+
+/// Sealing must not delete what the BUNDLE defined — it runs after the bundle's
+/// top-level code, so the bundle's own globals are part of the baseline.
+#[tokio::test]
+async fn sealing_keeps_the_bundles_own_globals() {
+    let dir = tempfile::tempdir().unwrap();
+    let bundle_path = dir.path().join("bundle-globals.js");
+    std::fs::write(
+        &bundle_path,
+        r#"globalThis.APP_CONFIG = { name: "morada" };
+           globalThis.renderPage = () => globalThis.APP_CONFIG.name;"#,
+    )
+    .unwrap();
+
+    let engine = SsrEngine::builder()
+        .bundle_path(&bundle_path)
+        .pool_size(1)
+        .seal_globals(true)
+        .build_engine()
+        .unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(engine.render_uncached("/", "{}").await.unwrap(), "morada");
+    }
+}
