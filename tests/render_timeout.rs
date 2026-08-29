@@ -1,7 +1,7 @@
 //! Item 2 / watchdog: a hanging render times out the caller AND the watchdog
 //! terminates the runaway so the worker is reclaimed (not wedged forever).
 //!
-//! Own test binary because the SSR bundle is process-global.
+//! Own test binary so this case gets an engine to itself.
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 

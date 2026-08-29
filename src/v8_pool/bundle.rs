@@ -1,20 +1,34 @@
 //! SSR Bundle loader
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use crate::error::{SsrError, SsrResult};
 
-/// Cached SSR bundle (loaded once at startup)
-static SSR_BUNDLE: OnceLock<String> = OnceLock::new();
-
-/// Browser polyfills for V8 compatibility
+/// Browser polyfills for V8 compatibility — the exact source prepended to your
+/// bundle.
 ///
 /// These mock browser APIs that don't exist in V8 isolates. Every global is
 /// defined **defensively** (only when absent), so a user bundle that ships its
 /// own implementation is never clobbered. The whole block can be skipped with
 /// `.polyfills(false)` on the engine builder.
-const BROWSER_POLYFILLS: &str = r#"
+///
+/// It is `pub` because testing an SSR bundle means running it in *this*
+/// environment, and the alternative is what projects end up doing instead:
+/// re-typing the prelude into a Node `vm` sandbox by hand. That copy drifts —
+/// silently, because a drifted probe still passes — and the first you hear of
+/// the drift is a blank page in production. Write the real thing out instead:
+///
+/// ```rust,no_run
+/// std::fs::write("prelude.js", rusty_ssr::v8_pool::BROWSER_POLYFILLS).unwrap();
+/// ```
+///
+/// Two things it deliberately does **not** define, so a bundle can
+/// feature-detect rather than receive a wrong implementation:
+/// `TextEncoder`/`TextDecoder`, and `atob`/`btoa`. If you are reaching for
+/// base64 to move bytes into a render, prefer
+/// [`render_with_bytes`](crate::SsrEngine::render_with_bytes) — it hands the
+/// bundle a `Uint8Array` and there is nothing to decode.
+pub const BROWSER_POLYFILLS: &str = r#"
 // =========================================
 // Rusty-SSR Browser Polyfills (non-clobbering)
 // =========================================
@@ -203,7 +217,10 @@ if (typeof globalThis.performance === 'undefined') globalThis.performance = {
     getEntriesByType: () => []
 };
 
-// Storage mock
+// Storage mock. NOTE this is real, working, in-memory storage — not a stub that
+// forgets. That matters because the isolate is pooled: without the reset below,
+// what one render writes here is readable by the next request on the same
+// worker, which is a different visitor.
 const createStorage = () => {
     const data = {};
     return {
@@ -215,8 +232,21 @@ const createStorage = () => {
         key: (i) => Object.keys(data)[i] ?? null
     };
 };
-if (typeof globalThis.localStorage === 'undefined') globalThis.localStorage = createStorage();
-if (typeof globalThis.sessionStorage === 'undefined') globalThis.sessionStorage = createStorage();
+// Tracked by IDENTITY, not by a flag set here. The prelude runs before the
+// bundle, so "was it undefined a moment ago" answers the wrong question: a
+// bundle is perfectly entitled to install its own storage afterwards, and the
+// reset below must not then throw that away. Comparing the object instead means
+// we only ever replace the one we made.
+let __rustyLocalStorage = null;
+let __rustySessionStorage = null;
+if (typeof globalThis.localStorage === 'undefined') {
+    __rustyLocalStorage = createStorage();
+    globalThis.localStorage = __rustyLocalStorage;
+}
+if (typeof globalThis.sessionStorage === 'undefined') {
+    __rustySessionStorage = createStorage();
+    globalThis.sessionStorage = __rustySessionStorage;
+}
 
 // Fetch mock (minimal - throws if actually used)
 if (typeof globalThis.fetch === 'undefined') globalThis.fetch = async () => {
@@ -348,92 +378,63 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
     globalThis.queueMicrotask = (cb) => { Promise.resolve().then(cb); };
 }
 
+// --- The request boundary ---
+//
+// The isolate is POOLED. `globalThis` outlives a render, so without this the
+// next request handled by this worker starts inside the previous request's
+// leftovers. Two distinct problems, and the second is the serious one:
+//
+//   - correctness: a module-level cache in the bundle answers request B with
+//     request A's data, which looks exactly like a caching bug and is nearly
+//     impossible to reproduce, because it depends on which worker picked you up;
+//   - privacy: A and B are different people. Anything the render stashed —
+//     a session, a profile, a cart — is readable by the next visitor.
+//
+// rusty-ssr calls this immediately before every render. It resets the storage
+// objects it owns (a bundle that brought its own is left alone), then hands off
+// to `globalThis.onSsrRequest` if the bundle defines one. THAT is where a
+// bundle clears its own module state; define it next to whatever you cache.
+//
+// A throw here fails the render rather than being swallowed: a request that
+// could not be isolated must not be served with someone else's state in it.
+globalThis.__rustySsrReset = function () {
+    if (__rustyLocalStorage !== null && globalThis.localStorage === __rustyLocalStorage) {
+        __rustyLocalStorage = createStorage();
+        globalThis.localStorage = __rustyLocalStorage;
+    }
+    if (__rustySessionStorage !== null && globalThis.sessionStorage === __rustySessionStorage) {
+        __rustySessionStorage = createStorage();
+        globalThis.sessionStorage = __rustySessionStorage;
+    }
+    if (typeof globalThis.onSsrRequest === 'function') globalThis.onSsrRequest();
+};
+
 "#;
 
-/// Initialize the SSR bundle from a file
+/// Read a bundle from disk and prepend the prelude, without touching any global
+/// state.
 ///
-/// This should be called once at application startup.
-/// The bundle is cached and reused for all V8 workers.
-/// Browser polyfills are automatically prepended.
+/// This is what [`SsrEngine`](crate::SsrEngine) uses. The `init_bundle*`
+/// functions above put the composed source in a process-global `OnceLock`, and
+/// that global is why two engines could never have two different bundles: the
+/// second `init` quietly returned the first one's source, so the second engine
+/// rendered with the wrong code. It also meant a test file could hold only one
+/// bundle however many cases it had, which is a strange thing for a library to
+/// impose on the people testing against it.
 ///
-/// Equivalent to [`init_bundle_with`]`(path, true)`.
-pub fn init_bundle<P: AsRef<Path>>(path: P) -> SsrResult<()> {
-    init_bundle_with(path, true)
-}
-
-/// Initialize the SSR bundle from a file, choosing whether to prepend the
-/// built-in browser polyfills.
-///
-/// Pass `polyfills = false` when your bundle already provides every global it
-/// needs — the file is then loaded verbatim. The polyfills are otherwise
-/// non-clobbering, so leaving them on is safe even for bundles that ship some
-/// of their own globals.
-pub fn init_bundle_with<P: AsRef<Path>>(path: P, polyfills: bool) -> SsrResult<()> {
+/// The composed string is handed to the pool, which hands it to each worker.
+/// Nothing is shared between engines.
+pub fn compose<P: AsRef<Path>>(path: P, polyfills: bool) -> SsrResult<String> {
     let path = path.as_ref();
-
-    if SSR_BUNDLE.get().is_some() {
-        return Ok(());
-    }
-
-    tracing::info!(
-        "📦 Loading SSR bundle from {:?} (polyfills={})",
-        path,
-        polyfills
-    );
+    tracing::info!("📦 Loading SSR bundle from {:?} (polyfills={})", path, polyfills);
 
     let user_bundle = std::fs::read_to_string(path).map_err(|e| {
         SsrError::BundleLoad(format!("Failed to read SSR bundle from {:?}: {}", path, e))
     })?;
 
-    let full_bundle = if polyfills {
+    Ok(if polyfills {
         format!("{}\n{}", BROWSER_POLYFILLS, user_bundle)
     } else {
         user_bundle
-    };
-
-    // Tolerate a concurrent first-time init: the `get()` check above and this
-    // `set()` are not atomic, so two threads building engines at once can both
-    // reach here. The bundle is process-global and load-once, so a losing
-    // `set()` race just means another thread already loaded it — that's success,
-    // not an error.
-    let _ = SSR_BUNDLE.set(full_bundle);
-
-    Ok(())
-}
-
-/// Initialize the SSR bundle from a string
-///
-/// Use this if you want to embed the bundle or load it from elsewhere.
-/// Browser polyfills are automatically prepended.
-pub fn init_bundle_from_string(bundle: String) -> SsrResult<()> {
-    let full_bundle = format!("{}\n{}", BROWSER_POLYFILLS, bundle);
-    SSR_BUNDLE
-        .set(full_bundle)
-        .map_err(|_| SsrError::BundleLoad("Bundle already initialized".to_string()))?;
-    Ok(())
-}
-
-/// Initialize the SSR bundle from a string WITHOUT polyfills
-///
-/// Use this if your bundle already includes all necessary globals.
-pub fn init_bundle_raw(bundle: String) -> SsrResult<()> {
-    SSR_BUNDLE
-        .set(bundle)
-        .map_err(|_| SsrError::BundleLoad("Bundle already initialized".to_string()))?;
-    Ok(())
-}
-
-/// Get the cached SSR bundle
-///
-/// # Panics
-/// Panics if the bundle has not been initialized.
-pub fn get_bundle() -> &'static str {
-    SSR_BUNDLE
-        .get()
-        .expect("SSR bundle not initialized. Call init_bundle() first.")
-}
-
-/// Check if the bundle is initialized
-pub fn is_initialized() -> bool {
-    SSR_BUNDLE.get().is_some()
+    })
 }

@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
+use super::renderer::RenderPayload;
 use super::{renderer, runtime};
 
 /// Per-worker termination state for the render watchdog.
@@ -58,6 +59,13 @@ pub struct V8PoolConfig {
 
     /// Maximum V8 heap size per isolate, in megabytes (None = unbounded)
     pub max_heap_mb: Option<usize>,
+
+    /// The composed bundle source (prelude + user bundle) every worker loads.
+    ///
+    /// Owned by the pool rather than read from a process-global, so two engines
+    /// in one process can render two different applications — and so a test
+    /// binary can hold more than one bundle.
+    pub bundle: Arc<str>,
 }
 
 impl Default for V8PoolConfig {
@@ -69,6 +77,7 @@ impl Default for V8PoolConfig {
             request_timeout: Some(Duration::from_secs(30)),
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
+            bundle: Arc::from(""),
         }
     }
 }
@@ -76,7 +85,7 @@ impl Default for V8PoolConfig {
 /// Internal render request
 struct RenderRequest {
     url: String,
-    data: String,
+    data: RenderPayload,
     render_function: String,
     response_tx: oneshot::Sender<Result<String, String>>,
 }
@@ -188,6 +197,7 @@ impl V8Pool {
                 core_affinity.clone(),
                 Arc::clone(&pool.next_core),
                 config.max_heap_mb,
+                Arc::clone(&config.bundle),
                 watchdog.clone(),
             );
         }
@@ -207,8 +217,34 @@ impl V8Pool {
         self.render_with_data(url, "{}".to_string()).await
     }
 
-    /// Render a URL to HTML with custom data
+    /// Render a URL to HTML with a JSON payload.
     pub async fn render_with_data(&self, url: String, data: String) -> Result<String, PoolError> {
+        self.render_with_payload(url, RenderPayload::Json(data)).await
+    }
+
+    /// Render a URL to HTML with raw bytes, delivered as a `Uint8Array`.
+    pub async fn render_with_bytes(&self, url: String, data: Vec<u8>) -> Result<String, PoolError> {
+        self.render_with_payload(url, RenderPayload::Bytes(data)).await
+    }
+
+    /// Render with a JSON envelope and a binary payload beside it:
+    /// `renderPage(url, data, bytes)`.
+    pub async fn render_with_json_and_bytes(
+        &self,
+        url: String,
+        json: String,
+        bytes: Vec<u8>,
+    ) -> Result<String, PoolError> {
+        self.render_with_payload(url, RenderPayload::JsonWithBytes { json, bytes })
+            .await
+    }
+
+    /// Render a URL to HTML with whichever payload shape the caller has.
+    pub async fn render_with_payload(
+        &self,
+        url: String,
+        data: RenderPayload,
+    ) -> Result<String, PoolError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let request = RenderRequest {
@@ -318,6 +354,7 @@ fn spawn_worker(
     core_affinity: Option<Arc<Vec<CoreId>>>,
     next_core: Arc<AtomicUsize>,
     max_heap_mb: Option<usize>,
+    bundle: Arc<str>,
     watchdog: Option<Arc<Watchdog>>,
 ) {
     // Increment worker count
@@ -340,7 +377,7 @@ fn spawn_worker(
         }
 
         // Initialize V8 runtime for this thread (with optional heap cap)
-        if let Err(e) = runtime::init_runtime(max_heap_mb) {
+        if let Err(e) = runtime::init_runtime(&bundle, max_heap_mb) {
             tracing::error!("❌ Failed to initialize V8 for worker {}: {}", id, e);
             let mut count = worker_count.lock().unwrap();
             *count -= 1;
@@ -370,8 +407,14 @@ fn spawn_worker(
             };
 
             if let Some(req) = request {
+                // Destructured so the payload can be *moved* into the render
+                // rather than cloned. A bytes payload becomes V8's backing
+                // store directly, and cloning it here would undo exactly the
+                // copy that shape exists to avoid.
+                let RenderRequest { url, data, render_function, response_tx } = req;
+
                 // Prefetch data for better cache performance
-                prefetch_data(&req.data);
+                prefetch_data(&data);
 
                 // Arm the watchdog for this render's deadline.
                 if let Some(wd) = &watchdog {
@@ -391,12 +434,7 @@ fn spawn_worker(
                         state.runtime.v8_isolate().cancel_terminate_execution();
                     }
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        renderer::render_html(
-                            &req.url,
-                            Some(&req.data),
-                            &req.render_function,
-                            state,
-                        )
+                        renderer::render_html(&url, data, &render_function, state)
                     }))
                     .unwrap_or_else(|_| Err("render panicked".to_string()))
                 });
@@ -407,7 +445,7 @@ fn spawn_worker(
                 }
 
                 // Send response
-                let _ = req.response_tx.send(result);
+                let _ = response_tx.send(result);
 
                 requests_processed += 1;
             }
@@ -427,7 +465,7 @@ fn spawn_worker(
 
 /// Prefetch data into CPU cache
 #[inline]
-fn prefetch_data(data: &str) {
+fn prefetch_data(data: &RenderPayload) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         unsafe {
@@ -469,6 +507,7 @@ impl V8Pool {
             request_timeout: Some(Duration::from_millis(10)),
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
+            bundle: Arc::from(""),
         })
     }
 }

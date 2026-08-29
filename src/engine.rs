@@ -9,10 +9,13 @@ use crate::error::{SsrError, SsrResult};
 use crate::v8_pool::{PoolError, V8Pool};
 
 #[cfg(feature = "cache")]
-use crate::cache::SsrCache;
+use crate::cache::{BuiltPage, CachedPage, PageCache, RenderKey, SsrCache};
 
 #[cfg(feature = "cache")]
 use std::borrow::Cow;
+
+#[cfg(feature = "cache")]
+use std::future::Future;
 
 /// Separator between the URL part and the render-data part of a cache key.
 ///
@@ -211,6 +214,12 @@ pub struct SsrEngine {
 
     #[cfg(feature = "cache")]
     cache: SsrCache,
+
+    /// Finished documents, keyed by whatever the caller says decides them.
+    /// `Arc` because a stale-while-revalidate rebuild outlives the request that
+    /// noticed the page had expired.
+    #[cfg(feature = "cache")]
+    page_cache: Arc<PageCache>,
 }
 
 impl SsrEngine {
@@ -246,8 +255,12 @@ impl SsrEngine {
 
         #[cfg(feature = "v8-pool")]
         let v8_pool = {
-            // Initialize the V8 bundle (optionally with built-in polyfills)
-            crate::v8_pool::init_bundle_with(&config.bundle_path, config.polyfills)?;
+            // Composed here and owned by the pool. It used to go into a
+            // process-global `OnceLock`, which meant the *second* engine built
+            // in a process silently rendered the *first* engine's bundle — and
+            // meant a test binary could only ever hold one.
+            let bundle: Arc<str> =
+                Arc::from(crate::v8_pool::compose(&config.bundle_path, config.polyfills)?);
 
             V8Pool::new(crate::v8_pool::V8PoolConfig {
                 num_threads: config.pool_size,
@@ -256,6 +269,7 @@ impl SsrEngine {
                 request_timeout: config.request_timeout,
                 render_function: config.render_function.clone(),
                 max_heap_mb: config.max_heap_mb,
+                bundle,
             })
         };
 
@@ -265,6 +279,9 @@ impl SsrEngine {
             SsrCache::with_ttl(config.cache_size, ttl_secs)
         };
 
+        #[cfg(feature = "cache")]
+        let page_cache = Arc::new(PageCache::new(config.page_cache));
+
         Ok(Self {
             config,
             template,
@@ -272,6 +289,8 @@ impl SsrEngine {
             v8_pool,
             #[cfg(feature = "cache")]
             cache,
+            #[cfg(feature = "cache")]
+            page_cache,
         })
     }
 
@@ -449,6 +468,80 @@ impl SsrEngine {
             .map_err(Self::map_pool_error)
     }
 
+    /// Render without caching, handing the bundle raw bytes.
+    ///
+    /// The payload arrives as a `Uint8Array` over the very buffer passed in —
+    /// no copy on the Rust side, no decoding on the JS side. Reach for this
+    /// whenever the data is genuinely binary (protobuf, MessagePack, an image):
+    /// the alternative is base64 inside JSON, which costs a third more bytes on
+    /// the way in *and* obliges the bundle to carry its own `atob`, since the
+    /// prelude deliberately ships none.
+    ///
+    /// Uncached by design: bytes are a payload, and whether a payload belongs
+    /// in a cache key is a question only the caller can answer — see
+    /// [`RenderKey::variant_digest`](crate::cache::RenderKey::variant_digest)
+    /// for the cheap way to say yes.
+    ///
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # async fn example(engine: SsrEngine, protobuf: Vec<u8>) {
+    /// let html = engine.render_with_bytes("/catalog", protobuf).await.unwrap();
+    /// # }
+    /// ```
+    /// ```js
+    /// // …and in the bundle:
+    /// globalThis.renderPage = (url, data) => {
+    ///     const bytes = data instanceof Uint8Array ? data : null;
+    ///     // decode straight from `bytes` — it is already the wire format
+    /// };
+    /// ```
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_with_bytes(&self, url: &str, data: Vec<u8>) -> SsrResult<String> {
+        self.v8_pool
+            .render_with_bytes(url.to_string(), data)
+            .await
+            .map_err(Self::map_pool_error)
+    }
+
+    /// Render without caching, with a JSON envelope AND a binary payload: the
+    /// bundle is called as `renderPage(url, data, bytes)`.
+    ///
+    /// This is the shape most page data actually has — a handful of scalars
+    /// describing what the payload is, wrapped around one large blob. Squeezing
+    /// both into the single JSON argument means base64-ing the blob into a
+    /// string field and decoding it back inside V8, which for a payload of any
+    /// size is milliseconds of every render spent on an encoding that existed
+    /// only to satisfy the argument list.
+    ///
+    /// A bundle written as `function(url, data)` ignores the third argument, so
+    /// this can be adopted one side at a time.
+    ///
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # async fn example(engine: SsrEngine, rows: Vec<u8>) {
+    /// let html = engine
+    ///     .render_with_json_and_bytes(
+    ///         "/venda/blumenau",
+    ///         r#"{"city":"Blumenau","page":1,"sort":"relevance"}"#,
+    ///         rows,
+    ///     )
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_with_json_and_bytes(
+        &self,
+        url: &str,
+        json: &str,
+        bytes: Vec<u8>,
+    ) -> SsrResult<String> {
+        self.v8_pool
+            .render_with_json_and_bytes(url.to_string(), json.to_string(), bytes)
+            .await
+            .map_err(Self::map_pool_error)
+    }
+
     /// Render without caching with JSON data
     #[cfg(feature = "v8-pool")]
     pub async fn render_uncached_json(
@@ -570,10 +663,55 @@ impl SsrEngine {
         &self.config
     }
 
-    /// Get a reference to the cache (if enabled)
+    /// Get a reference to the fragment cache (if enabled)
     #[cfg(feature = "cache")]
     pub fn cache(&self) -> &SsrCache {
         &self.cache
+    }
+
+    /// The page cache — finished documents, keyed by [`RenderKey`].
+    ///
+    /// Use it directly for the lookup-and-store shape (`get` before the queries
+    /// a build would run, `store` once the document is assembled), or go
+    /// through [`page`](Self::page) to get single-flight and revalidation too.
+    #[cfg(feature = "cache")]
+    pub fn page_cache(&self) -> &Arc<PageCache> {
+        &self.page_cache
+    }
+
+    /// The finished document for `key`, building it with `build` on a miss.
+    ///
+    /// This is the method most HTTP applications want, and the one the fragment
+    /// cache behind [`render`](Self::render) cannot be: `build` returns the
+    /// **whole response** — status and assembled document — so a hit skips not
+    /// just the V8 render but every query and injection that went into the
+    /// page. Concurrent callers for one cold key share a single build, and with
+    /// a stale window configured nobody waits for a rebuild.
+    ///
+    /// ```rust,no_run
+    /// # use rusty_ssr::{SsrEngine, cache::{BuiltPage, RenderKey}};
+    /// # async fn example(engine: std::sync::Arc<SsrEngine>, host: String, path: String) {
+    /// // The Host header decides the canonical URLs on the page, so it is part
+    /// // of what the page *is* — and therefore part of the key.
+    /// let key = RenderKey::new(&path).variant("host", &host);
+    /// let engine2 = engine.clone();
+    /// let page = engine
+    ///     .page(&key, move || async move {
+    ///         let fragment = engine2.render_uncached(&path, "{}").await?;
+    ///         Ok(BuiltPage::ok(format!("<!doctype html><body>{fragment}")))
+    ///     })
+    ///     .await
+    ///     .unwrap();
+    /// // page.body is `Bytes` — answering is a refcount bump, not a copy.
+    /// # }
+    /// ```
+    #[cfg(feature = "cache")]
+    pub async fn page<F, Fut>(&self, key: &RenderKey, build: F) -> SsrResult<CachedPage>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = SsrResult<BuiltPage>> + Send + 'static,
+    {
+        self.page_cache.get_or_build(key, build).await
     }
 
     /// Get a reference to the V8 pool (if enabled)

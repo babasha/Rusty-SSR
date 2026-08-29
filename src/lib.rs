@@ -88,7 +88,9 @@ pub mod prelude {
     pub use crate::error::{SsrError, SsrResult};
 
     #[cfg(feature = "cache")]
-    pub use crate::cache::{SsrCache, CacheMetrics};
+    pub use crate::cache::{
+        CacheMetrics, CachePolicy, CachedPage, PageCache, RenderKey, SsrCache,
+    };
 
     #[cfg(feature = "v8-pool")]
     pub use crate::v8_pool::{V8Pool, V8PoolConfig};

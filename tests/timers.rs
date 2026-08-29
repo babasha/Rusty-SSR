@@ -1,6 +1,6 @@
 //! Item 6: setTimeout is deferred to a microtask, not run synchronously.
 //!
-//! Own test binary because the SSR bundle is process-global.
+//! Own test binary so this case gets an engine to itself.
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 

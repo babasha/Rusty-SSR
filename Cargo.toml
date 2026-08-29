@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
@@ -38,7 +38,7 @@ strip = true
 [features]
 default = ["v8-pool", "cache", "axum-integration"]
 v8-pool = ["deno_core", "serde_v8"]
-cache = ["dashmap", "parking_lot", "lru"]
+cache = ["dashmap", "parking_lot", "lru", "bytes"]
 axum-integration = ["axum", "tower", "tower-http"]
 brotli-compression = ["brotli", "tokio/fs"]
 full = ["v8-pool", "cache", "axum-integration", "brotli-compression"]
@@ -69,6 +69,11 @@ serde_v8 = { version = "0.231", optional = true }
 dashmap = { version = "6.1", optional = true }
 parking_lot = { version = "0.12", optional = true }
 lru = { version = "0.12", optional = true }
+
+# Cheap-to-clone byte buffers. A page-cache hit hands back a refcount bump
+# rather than a copy of the document, which is most of the point of caching a
+# finished page instead of a fragment.
+bytes = { version = "1", optional = true }
 
 # CPU affinity for thread pinning
 core_affinity = "0.8"

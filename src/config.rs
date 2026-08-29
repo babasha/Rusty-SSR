@@ -85,6 +85,16 @@ pub struct SsrConfig {
     /// render function. `invalidate` normalizes too; `invalidate_prefix`
     /// matches on the (normalized) stored keys.
     pub cache_key_normalizer: Option<fn(&str) -> String>,
+
+    /// Policy for the page cache — finished documents keyed by
+    /// [`RenderKey`](crate::cache::RenderKey), with single-flight and
+    /// stale-while-revalidate.
+    ///
+    /// Separate from `cache_size`/`cache_ttl`, which govern the fragment cache
+    /// behind `render`/`render_with_data`. The two are different tiers holding
+    /// different things; see [`crate::cache::page`].
+    #[cfg(feature = "cache")]
+    pub page_cache: crate::cache::CachePolicy,
 }
 
 impl Default for SsrConfig {
@@ -104,6 +114,8 @@ impl Default for SsrConfig {
             cache_empty: true,
             max_heap_mb: None,
             cache_key_normalizer: None,
+            #[cfg(feature = "cache")]
+            page_cache: crate::cache::CachePolicy::default(),
         }
     }
 }
@@ -132,6 +144,8 @@ pub struct SsrConfigBuilder {
     cache_empty: Option<bool>,
     max_heap_mb: Option<usize>,
     cache_key_normalizer: Option<fn(&str) -> String>,
+    #[cfg(feature = "cache")]
+    page_cache: Option<crate::cache::CachePolicy>,
 }
 
 impl SsrConfigBuilder {
@@ -303,6 +317,32 @@ impl SsrConfigBuilder {
         self
     }
 
+    /// Set the policy for the **page** cache — finished documents, keyed by
+    /// [`RenderKey`](crate::cache::RenderKey).
+    ///
+    /// Independent of `cache_size`/`cache_ttl`, which govern the older fragment
+    /// cache. An application serving HTTP usually wants this one and can leave
+    /// the fragment cache at [`CachePolicy::Off`]-equivalent by simply never
+    /// calling `render`/`render_with_data`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use rusty_ssr::{SsrConfig, cache::CachePolicy};
+    /// use std::time::Duration;
+    ///
+    /// let config = SsrConfig::builder()
+    ///     .page_cache(
+    ///         CachePolicy::ttl(500, Duration::from_secs(300))
+    ///             .stale_while_revalidate(Duration::from_secs(600)),
+    ///     )
+    ///     .build();
+    /// ```
+    #[cfg(feature = "cache")]
+    pub fn page_cache(mut self, policy: crate::cache::CachePolicy) -> Self {
+        self.page_cache = Some(policy);
+        self
+    }
+
     /// Build the configuration
     ///
     /// # Errors
@@ -329,6 +369,8 @@ impl SsrConfigBuilder {
             cache_empty: self.cache_empty.unwrap_or(default.cache_empty),
             max_heap_mb: self.max_heap_mb,
             cache_key_normalizer: self.cache_key_normalizer,
+            #[cfg(feature = "cache")]
+            page_cache: self.page_cache.unwrap_or(default.page_cache),
         };
 
         if config.pool_size == 0 {

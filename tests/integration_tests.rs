@@ -45,6 +45,7 @@ mod pool_config_tests {
             request_timeout: Some(std::time::Duration::from_secs(1)),
             render_function: "customRender".to_string(),
             max_heap_mb: None,
+            bundle: std::sync::Arc::from(""),
         };
 
         assert_eq!(config.num_threads, 4);
@@ -63,6 +64,7 @@ mod pool_config_tests {
             request_timeout: None,
             render_function: "render".to_string(),
             max_heap_mb: None,
+            bundle: std::sync::Arc::from(""),
         };
 
         let cloned = config.clone();
@@ -93,6 +95,7 @@ mod pool_timeout_tests {
             request_timeout: Some(Duration::from_millis(5)),
             render_function: "renderPage".to_string(),
             max_heap_mb: None,
+            bundle: std::sync::Arc::from(""),
         });
 
         let result = pool

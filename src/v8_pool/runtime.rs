@@ -4,7 +4,7 @@ use deno_core::{v8, JsRuntime, RuntimeOptions};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::bundle;
+
 
 /// Per-thread V8 state: the runtime plus a cached handle to the render
 /// function so it's resolved once instead of recompiled per request.
@@ -13,6 +13,15 @@ pub struct RuntimeState {
     pub runtime: JsRuntime,
     /// Cached `globalThis.<render_function>` handle (resolved on first render).
     pub render_fn: Option<v8::Global<v8::Function>>,
+    /// Cached `globalThis.__rustySsrReset` handle — the per-request boundary the
+    /// prelude installs.
+    ///
+    /// Two levels of `Option` on purpose. The outer says whether we have looked
+    /// yet; the inner says what we found. A bundle loaded with
+    /// `.polyfills(false)` and no hook of its own is a legitimate state, and
+    /// without the outer flag we would re-resolve — and re-fail — on every
+    /// single render.
+    pub reset_fn: Option<Option<v8::Global<v8::Function>>>,
 }
 
 thread_local! {
@@ -28,7 +37,7 @@ thread_local! {
 /// `max_heap_mb` caps the isolate's heap. When a render approaches the cap,
 /// its execution is terminated (surfacing as an `Err` that is not cached)
 /// instead of the whole process aborting on OOM.
-pub fn init_runtime(max_heap_mb: Option<usize>) -> Result<(), String> {
+pub fn init_runtime(bundle_source: &str, max_heap_mb: Option<usize>) -> Result<(), String> {
     JS_RUNTIME.with(|slot| {
         let mut slot = slot.borrow_mut();
 
@@ -54,16 +63,17 @@ pub fn init_runtime(max_heap_mb: Option<usize>) -> Result<(), String> {
                 });
             }
 
-            // Load the cached SSR bundle (zero-copy - uses &'static str)
-            let bundle_code = bundle::get_bundle();
-
+            // The pool's own bundle source, not a process-global one: two
+            // engines in one process are two different applications and must be
+            // able to render two different bundles.
             js_runtime
-                .execute_script("<ssr-bundle>", bundle_code)
+                .execute_script("<ssr-bundle>", bundle_source.to_string())
                 .map_err(|e| format!("Failed to load SSR bundle: {}", e))?;
 
             *slot = Some(RuntimeState {
                 runtime: js_runtime,
                 render_fn: None,
+                reset_fn: None,
             });
 
             tracing::debug!(

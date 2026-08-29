@@ -154,6 +154,57 @@ Request → L1/L2 Hot Cache (1-3ns) → Cold Cache (100ns) → V8 Render
 - **Cold cache**: DashMap with LRU eviction
 - **Automatic**: No configuration needed
 
+That tier caches the **fragment** the render returned. Above it sits the page
+cache, which caches the **response**.
+
+### Page Cache (0.2)
+
+Between the render and the response there is usually work the render cannot do:
+`<head>` tags from a database, a serialised store for the client to hydrate
+from, a status code. Caching the fragment means redoing all of it on every hit.
+And the URL alone is rarely the key — one path under two hostnames is two
+documents the moment a canonical URL is built from the Host header.
+
+So: you say what the key is, you build the document, and the cache does the rest.
+
+```rust
+use rusty_ssr::cache::{BuiltPage, CachePolicy, RenderKey};
+use std::time::Duration;
+
+let engine = SsrEngine::builder()
+    .bundle_path("ssr-bundle.js")
+    .page_cache(
+        CachePolicy::ttl(500, Duration::from_secs(300))
+            .stale_while_revalidate(Duration::from_secs(300)),
+    )
+    .build_engine()?;
+
+// The Host header is inside the document, so it is part of the key.
+let key = RenderKey::new(&path).variant("host", &host);
+
+let page = engine.page(&key, move || async move {
+    let meta = load_seo(&path).await?;                  // a database round trip
+    let fragment = engine2.render_uncached(&path, "{}").await?;
+    Ok(BuiltPage::new(meta.status, assemble(fragment, meta)))
+}).await?;
+
+// page.body is `Bytes` — answering is a refcount bump, not a copy.
+```
+
+What that buys over caching the fragment:
+
+| | |
+|---|---|
+| **A hit costs nothing** | the closure never runs, so those database round trips never happen either |
+| **Single-flight** | forty concurrent requests for one cold key run **one** build, not forty |
+| **Stale-while-revalidate** | an expired page is answered immediately while its replacement builds behind the visitor |
+| **Status and headers travel** | a 404 body is served as a 404; a redirect is cacheable like anything else |
+| **`Bytes` bodies** | a hit hands back a refcount bump |
+
+`CachePolicy` is `Off` / `ttl(capacity, d)` / `forever(capacity)` — "off" is a
+variant, not a magic zero. `RenderKey::variant_digest` keys on a payload
+without storing it, for when the data can change independently of the URL.
+
 ### Framework Agnostic
 
 Works with any JavaScript framework that supports SSR:
@@ -199,6 +250,32 @@ let html = engine.render_to_html_with_replacements(
     ],
 ).await?;
 ```
+
+### What's in 0.2.0
+
+Everything here came out of running 0.1 in production for a season. Full notes
+in [CHANGELOG.md](CHANGELOG.md).
+
+- **A page cache** — finished documents keyed by `RenderKey`, with
+  single-flight, stale-while-revalidate, `CachePolicy`, and status + headers +
+  `Bytes` bodies. See above.
+- **A request boundary in the pooled isolate.** `globalThis` outlives a render
+  and the prelude's `localStorage` is real storage, so request B used to start
+  inside request A's leftovers — and A and B are different people. The prelude
+  now resets its own state before every render and calls `onSsrRequest()` so the
+  bundle can clear its own.
+- **Binary payloads.** `render_with_bytes` delivers a `Uint8Array` over the very
+  buffer you passed; `render_with_json_and_bytes` gives you
+  `renderPage(url, data, bytes)` — a JSON envelope beside a blob, without
+  base64 in between.
+- **The bundle is no longer process-global.** Two engines in one process are two
+  applications now; before, the second silently rendered the first one's bundle.
+- **`BROWSER_POLYFILLS` is public**, so a bundle can be tested in the real
+  environment instead of a hand-copied imitation of it that drifts.
+
+Breaking: the `init_bundle*` / `get_bundle` / `is_initialized` family is gone
+(replaced by `v8_pool::compose`), `V8PoolConfig` gained a `bundle` field, and
+`renderer::render_html` takes a `RenderPayload`.
 
 ### What's in 0.1.1
 
