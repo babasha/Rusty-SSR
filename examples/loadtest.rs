@@ -9,7 +9,12 @@
 //!                         served from the cache. Default: 0
 //!   --pool-size <n>       V8 workers. Default: one per CPU
 //!   --cache-size <n>      Fragment-cache capacity. Default: 300
-//!   --payload <bytes>     Approximate size of the JSON payload. Default: 64
+//!   --rows <n>            Listings in the payload; this is the dial that
+//!                         decides what one render costs. Default: 5
+//!   --bundle <path>       Render with a real bundle instead of the built-in
+//!                         stub. The stub measures engine overhead; a real
+//!                         framework bundle measures the pool.
+//!   --quiet               Result lines only
 //! ```
 //!
 //! Two scenarios are worth running, and they measure entirely different things:
@@ -43,9 +48,9 @@ use std::time::{Duration, Instant};
 
 const TEST_BUNDLE: &str = r#"
     globalThis.renderPage = async function(url, data) {
-        let items = '';
-        if (data && data.items) {
-            items = '<ul>' + data.items.map(i => '<li>' + i + '</li>').join('') + '</ul>';
+        let items = "";
+        if (data && data.rows) {
+            items = "<ul>" + data.rows.map(r => "<li>" + r.title + "</li>").join("") + "</ul>";
         }
         return '<!DOCTYPE html><html><head><title>' + url + '</title></head>'
              + '<body><h1>' + url + '</h1>' + items
@@ -119,18 +124,22 @@ struct Options {
     hit_ratio: usize,
     pool_size: usize,
     cache_size: usize,
-    payload_bytes: usize,
+    rows: usize,
+    bundle: Option<String>,
+    quiet: bool,
 }
 
 impl Options {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let value = |name: &str, default: usize| -> usize {
+        let text = |name: &str| -> Option<String> {
             args.iter()
                 .position(|a| a == name)
                 .and_then(|i| args.get(i + 1))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
+                .cloned()
+        };
+        let value = |name: &str, default: usize| -> usize {
+            text(name).and_then(|v| v.parse().ok()).unwrap_or(default)
         };
 
         Self {
@@ -139,9 +148,47 @@ impl Options {
             hit_ratio: value("--hit-ratio", 0).min(100),
             pool_size: value("--pool-size", num_cpus::get()),
             cache_size: value("--cache-size", 300),
-            payload_bytes: value("--payload", 64),
+            rows: value("--rows", 5),
+            bundle: text("--bundle"),
+            quiet: args.iter().any(|a| a == "--quiet"),
         }
     }
+}
+
+/// The payload a render is given: a page's worth of listings.
+///
+/// `rows` is the dial that decides what a render *costs*, which is the whole
+/// point of pointing this at a real bundle. A framework rendering eighty cards
+/// is doing the work an actual page does; a bundle that concatenates a string
+/// is measuring the engine's own overhead and nothing else.
+fn build_payload(rows: usize) -> String {
+    const DISTRICTS: [&str; 4] = ["Velha", "Garcia", "Itoupava", "Centro"];
+    let listings: Vec<serde_json::Value> = (0..rows)
+        .map(|i| {
+            serde_json::json!({
+                "id": i,
+                "slug": format!("apartamento-{i}-blumenau"),
+                "title": format!("Apartamento {} quartos — Edifício {i}", 1 + i % 4),
+                "district": DISTRICTS[i % 4],
+                "city": "Blumenau",
+                "photo": format!("/media/{i}.jpg"),
+                "bedrooms": 1 + i % 4,
+                "bathrooms": 1 + i % 3,
+                "parking": i % 3,
+                "area": 45 + (i * 7) % 160,
+                "price": 25_000_000i64 + (i as i64 * 137_000),
+                "discount": if i % 5 == 0 { 10 } else { 0 },
+                "featured": i % 7 == 0,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "heading": "Apartamentos à venda em Blumenau",
+        "tipo": "venda",
+        "rows": listings,
+    })
+    .to_string()
 }
 
 #[tokio::main]
@@ -149,8 +196,15 @@ async fn main() {
     let opts = Options::parse();
 
     let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("loadtest-bundle.js");
-    std::fs::write(&bundle_path, TEST_BUNDLE).unwrap();
+    let bundle_path = match &opts.bundle {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let p = dir.path().join("loadtest-bundle.js");
+            std::fs::write(&p, TEST_BUNDLE).unwrap();
+            p
+        }
+    };
+    let bundle_bytes = std::fs::metadata(&bundle_path).map(|m| m.len()).unwrap_or(0);
 
     println!("=== Rusty SSR Load Test ===");
     println!("Duration:    {}s", opts.duration.as_secs());
@@ -161,7 +215,15 @@ async fn main() {
         "Hit ratio:   {}% (hot set of {} URLs)",
         opts.hit_ratio, HOT_SET
     );
-    println!("Payload:     ~{} bytes", opts.payload_bytes);
+    println!(
+        "Bundle:      {} ({} bytes)",
+        match &opts.bundle {
+            Some(p) => p.as_str(),
+            None => "built-in stub",
+        },
+        bundle_bytes
+    );
+    println!("Rows:        {} listings per render", opts.rows);
     println!();
 
     let engine = Arc::new(
@@ -177,15 +239,46 @@ async fn main() {
     // The hot set, shared rather than copied into every task.
     let hot: Arc<Vec<String>> = Arc::new((0..HOT_SET).map(|i| format!("/hot/{i}")).collect());
 
-    // One payload of roughly the requested size, built once.
-    let item_count = opts.payload_bytes / 12;
-    let payload: Arc<String> = Arc::new(
-        serde_json::json!({
-            "items": (0..item_count).map(|j| format!("item-{j}")).collect::<Vec<_>>()
-        })
-        .to_string(),
+    let payload: Arc<String> = Arc::new(build_payload(opts.rows));
+
+    // What one render actually costs, measured before any load is applied:
+    // the pool's ceiling is `pool_size / render_time`, so this is the number
+    // every throughput figure below is a consequence of.
+    // V8 starts interpreted and only tiers up after a few hundred calls, so the
+    // first renders cost several times what the steady state does. Measuring
+    // without discarding them reports the warm-up, not the workload — at
+    // `--rows 1` that was the difference between 315 µs and the real figure.
+    const PROBE_WARMUP: u32 = 400;
+    const PROBE_RENDERS: u32 = 200;
+    let mut probe_bytes = 0usize;
+    for i in 0..PROBE_WARMUP {
+        if let Err(e) = engine.render_uncached(&format!("/warmup/{i}"), &payload).await {
+            eprintln!("probe render failed: {e}");
+            std::process::exit(1);
+        }
+    }
+    let probe_start = Instant::now();
+    for i in 0..PROBE_RENDERS {
+        match engine.render_uncached(&format!("/probe/{i}"), &payload).await {
+            Ok(html) => probe_bytes = html.len(),
+            Err(e) => {
+                eprintln!("probe render failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let per_render = probe_start.elapsed() / PROBE_RENDERS;
+    println!(
+        "Payload {} bytes → {} bytes of HTML, {:.3?} per render (single-threaded)",
+        payload.len(),
+        probe_bytes,
+        per_render
     );
-    println!("Payload is {} bytes of JSON.", payload.len());
+    println!(
+        "Pool ceiling at this cost: {:.0} renders/s across {} workers",
+        opts.pool_size as f64 / per_render.as_secs_f64(),
+        opts.pool_size
+    );
 
     println!("Warming up {} workers and the hot set...", opts.pool_size);
     for url in hot.iter().take(HOT_SET.min(opts.cache_size)) {
@@ -203,8 +296,11 @@ async fn main() {
 
     let start = Instant::now();
 
-    // Progress reporter.
-    let progress = {
+    // Progress reporter. Skipped under --quiet, which is what a sweep wants:
+    // one line per configuration rather than one every five seconds.
+    let progress = if opts.quiet {
+        tokio::spawn(async {})
+    } else {
         let stop = Arc::clone(&stop);
         let total = Arc::clone(&total_requests);
         let errors = Arc::clone(&total_errors);
@@ -218,13 +314,17 @@ async fn main() {
                 }
                 let current = total.load(Ordering::Relaxed);
                 let m = engine.cache_metrics();
+                let p = engine.pool_metrics();
                 println!(
-                    "  [{:>3.0}s] {:>9} reqs | {:>9.0} rps | {:>4} errors | hit rate: {:.1}%",
+                    "  [{:>3.0}s] {:>9} reqs | {:>9.0} rps | {:>4} errors | hit {:.1}% | pool {:>3.0}% busy ({}/{}), q={} | p99 {:?}",
                     start.elapsed().as_secs_f64(),
                     current,
                     (current - last) as f64 / 5.0,
                     errors.load(Ordering::Relaxed),
-                    m.hit_rate
+                    m.hit_rate,
+                    p.saturation,
+                    p.busy, p.workers, p.queued,
+                    p.render_p99
                 );
                 last = current;
             }
@@ -333,6 +433,14 @@ async fn main() {
         println!("  max:  {:>12.3?}", lats[lats.len() - 1]);
     }
 
+    println!();
+    let p = engine.pool_metrics();
+    println!("Pool:");
+    println!("  workers:    {}", p.workers);
+    println!("  renders:    {} ({} failed, {} timed out)", p.renders, p.failed, p.timeouts);
+    println!("  render p50: {:?}", p.render_p50);
+    println!("  render p95: {:?}", p.render_p95);
+    println!("  render p99: {:?}", p.render_p99);
     println!();
     println!("Cache:");
     println!("  lookups:    {}", metrics.lookups);

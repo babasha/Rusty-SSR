@@ -25,5 +25,5 @@ mod renderer;
 mod runtime;
 
 pub use bundle::{compose, BROWSER_POLYFILLS};
-pub use pool::{PoolError, V8Pool, V8PoolConfig};
+pub use pool::{PoolError, PoolMetrics, V8Pool, V8PoolConfig};
 pub use renderer::{RenderFnShape, RenderPayload};

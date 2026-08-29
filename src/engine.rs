@@ -294,6 +294,7 @@ impl SsrEngine {
                 bundle,
                 seal_globals: config.seal_globals,
             })
+            .map_err(SsrError::V8Init)?
         };
 
         #[cfg(feature = "cache")]
@@ -817,6 +818,19 @@ impl SsrEngine {
         Fut: Future<Output = SsrResult<BuiltPage>> + Send + 'static,
     {
         self.page_cache.get_or_build(key, build).await
+    }
+
+    /// What the render pool is doing right now.
+    ///
+    /// The companion to [`cache_metrics`](Self::cache_metrics), and the one that
+    /// answers the operational question a cache cannot: *how close am I to
+    /// capacity?* A pool serves at most `workers / render_time` requests per
+    /// second, throughput stops rising the moment every worker is busy, and
+    /// everything after that becomes queue delay. See
+    /// [`PoolMetrics`](crate::v8_pool::PoolMetrics).
+    #[cfg(feature = "v8-pool")]
+    pub fn pool_metrics(&self) -> crate::v8_pool::PoolMetrics {
+        self.v8_pool.metrics()
     }
 
     /// Get a reference to the V8 pool (if enabled)

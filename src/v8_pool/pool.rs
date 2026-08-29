@@ -89,6 +89,145 @@ impl WorkQueue {
     }
 }
 
+/// Buckets in the render-duration histogram: exact below 8 µs, then four steps
+/// per octave up to about an hour. See [`bucket_of`].
+const HISTOGRAM_BUCKETS: usize = 128;
+
+/// Which bucket a duration in microseconds falls in.
+///
+/// Four steps per power of two, so a reading is known to about 25% — enough to
+/// answer "where is my p99" and to choose a `pool_size`, which is what this is
+/// for. Storing a sample per render instead would be exact and would also mean
+/// unbounded memory on the one path that must not allocate.
+/// Indices 0..8 are exact microseconds; the octave scheme starts above them.
+const EXACT_BELOW: usize = 8;
+
+#[inline]
+fn bucket_of(micros: u64) -> usize {
+    if micros < EXACT_BELOW as u64 {
+        return micros as usize;
+    }
+    // `micros` is in [2^octave, 2^(octave+1)); the top two bits below that
+    // choose one of four steps within the octave.
+    let octave = 63 - micros.leading_zeros() as usize;
+    let sub = ((micros >> (octave - 2)) & 0b11) as usize;
+    ((octave - 3) * 4 + sub + EXACT_BELOW).min(HISTOGRAM_BUCKETS - 1)
+}
+
+/// The lower bound, in microseconds, of the bucket at `index`.
+fn bucket_floor(index: usize) -> u64 {
+    if index < EXACT_BELOW {
+        return index as u64;
+    }
+    let octave = (index - EXACT_BELOW) / 4 + 3;
+    let sub = ((index - EXACT_BELOW) % 4) as u64;
+    (4 + sub) << (octave - 2)
+}
+
+/// Everything the pool counts about itself.
+///
+/// The render path pays two clock reads and a handful of relaxed atomics per
+/// render. That is deliberately the opposite of the decision taken for the
+/// fragment cache, where the clock came *off* the hot path: a cache lookup costs
+/// tens of nanoseconds and timing it doubled the work, while a render costs tens
+/// of microseconds at the very least, so the same instrumentation is a tenth of
+/// a percent here. Cost is relative to the thing being measured.
+struct PoolStats {
+    /// Workers currently inside a render.
+    busy: AtomicUsize,
+    /// Requests handed to the queue and not yet picked up.
+    queued: AtomicUsize,
+    /// Renders that finished, whatever the outcome.
+    renders: AtomicU64,
+    /// Renders that came back as an error from JS.
+    failed: AtomicU64,
+    /// Requests that never produced an answer in time — no worker was free, or
+    /// the watchdog killed the render.
+    timeouts: AtomicU64,
+    /// Render durations, bucketed. See [`bucket_of`].
+    histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+}
+
+impl Default for PoolStats {
+    fn default() -> Self {
+        Self {
+            busy: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            renders: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl PoolStats {
+    #[inline]
+    fn record(&self, elapsed: Duration, ok: bool) {
+        self.renders.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        let idx = bucket_of(elapsed.as_micros().min(u64::MAX as u128) as u64);
+        self.histogram[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The duration below which `percentile` of renders finished.
+    ///
+    /// Reported as the floor of the bucket the percentile lands in, so it never
+    /// claims more precision than the histogram has.
+    fn percentile(&self, counts: &[u64; HISTOGRAM_BUCKETS], total: u64, percentile: f64) -> Duration {
+        if total == 0 {
+            return Duration::ZERO;
+        }
+        let want = (total as f64 * percentile / 100.0).ceil() as u64;
+        let mut seen = 0u64;
+        for (i, n) in counts.iter().enumerate() {
+            seen += n;
+            if seen >= want {
+                return Duration::from_micros(bucket_floor(i));
+            }
+        }
+        Duration::from_micros(bucket_floor(HISTOGRAM_BUCKETS - 1))
+    }
+}
+
+/// A snapshot of what the pool is doing.
+///
+/// The two numbers that decide capacity are [`saturation`](Self::saturation) and
+/// [`queue_pressure`](Self::queue_pressure). Throughput stops rising once every
+/// worker is busy, and everything after that becomes queue delay — so a pool
+/// sitting at 100% saturation with a filling queue is one that needs more
+/// workers or fewer callers, and no other metric will say so.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PoolMetrics {
+    /// Workers that loaded the bundle and are serving.
+    pub workers: usize,
+    /// Workers inside a render right now.
+    pub busy: usize,
+    /// Requests waiting for a worker right now.
+    pub queued: usize,
+    /// What `queue_capacity` was set to.
+    pub queue_capacity: usize,
+    /// Renders completed since start, whatever the outcome.
+    pub renders: u64,
+    /// Of those, how many came back as a JS error.
+    pub failed: u64,
+    /// Requests that timed out waiting for a worker or for their render.
+    pub timeouts: u64,
+    /// `busy / workers`, as a percentage. At 100 the pool is the bottleneck.
+    pub saturation: f64,
+    /// `queued / queue_capacity`, as a percentage. Rising while saturation sits
+    /// at 100 is the shape of a queue that will not drain.
+    pub queue_pressure: f64,
+    /// Median render duration.
+    pub render_p50: Duration,
+    /// 95th percentile render duration.
+    pub render_p95: Duration,
+    /// 99th percentile render duration.
+    pub render_p99: Duration,
+}
+
 /// Per-worker termination state for the render watchdog.
 struct WorkerWatch {
     /// Deadline of the in-flight render, as nanos since `Watchdog::start`;
@@ -214,7 +353,7 @@ impl std::error::Error for PoolError {}
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let pool = V8Pool::new(V8PoolConfig::default());
+///     let pool = V8Pool::new(V8PoolConfig::default()).expect("bundle loads");
 ///     let html = pool.render("https://example.com/page".to_string()).await;
 /// }
 /// ```
@@ -231,11 +370,25 @@ pub struct V8Pool {
     render_fn_shape: Arc<AtomicU8>,
     /// Render watchdog (present when `request_timeout` is set).
     watchdog: Option<Arc<Watchdog>>,
+    /// What the pool counts about itself. See [`PoolMetrics`].
+    stats: Arc<PoolStats>,
 }
 
 impl V8Pool {
     /// Create a new V8 thread pool
-    pub fn new(config: V8PoolConfig) -> Self {
+    /// Create a new V8 thread pool, waiting for every worker to load the bundle.
+    ///
+    /// Returns `Err` if any worker could not, and that is the whole point of the
+    /// signature. This used to return the pool unconditionally and leave each
+    /// worker to log its own failure and exit, so a bundle with a *syntax
+    /// error* produced: an engine that built successfully, a pool with zero
+    /// workers, and every request hanging for the full `request_timeout` before
+    /// failing with "Render timeout". The real message went to `tracing::error!`
+    /// and was invisible to anyone without a subscriber installed.
+    ///
+    /// Waiting also moves isolate creation and bundle compilation out of the
+    /// first request, which used to pay for both.
+    pub fn new(config: V8PoolConfig) -> Result<Self, String> {
         tracing::info!("🔧 Creating V8 pool with {} threads", config.num_threads);
 
         let queue = Arc::new(WorkQueue::new());
@@ -267,6 +420,7 @@ impl V8Pool {
         });
 
         let render_fn_shape = Arc::new(AtomicU8::new(0));
+        let stats = Arc::new(PoolStats::default());
 
         let pool = Self {
             queue: Arc::clone(&queue),
@@ -275,9 +429,13 @@ impl V8Pool {
             render_fn_shape: Arc::clone(&render_fn_shape),
             watchdog: watchdog.clone(),
             config: config.clone(),
+            stats: Arc::clone(&stats),
         };
 
-        // Spawn worker threads
+        // Spawn worker threads. Each reports the outcome of loading the bundle
+        // before it starts serving, and this call does not return until they
+        // all have.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let render_function: Arc<str> = Arc::from(config.render_function.as_str());
         for i in 0..config.num_threads {
             spawn_worker(WorkerSetup {
@@ -291,7 +449,24 @@ impl V8Pool {
                 seal_globals: config.seal_globals,
                 render_fn_shape: Arc::clone(&render_fn_shape),
                 watchdog: watchdog.clone(),
+                ready: ready_tx.clone(),
+                stats: Arc::clone(&stats),
             });
+        }
+        drop(ready_tx);
+
+        for _ in 0..config.num_threads {
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                // A bundle that fails to load fails identically in every
+                // worker, so the first message is the message.
+                Ok(Err(e)) => return Err(e),
+                // The thread went away without reporting — a panic during
+                // isolate creation. Nothing else will say so.
+                Err(_) => {
+                    return Err("a V8 worker died before it finished starting".to_string())
+                }
+            }
         }
 
         // Spawn the watchdog thread.
@@ -301,7 +476,7 @@ impl V8Pool {
 
         tracing::info!("✅ Started {} V8 workers", config.num_threads);
 
-        pool
+        Ok(pool)
     }
 
     /// Render a URL to HTML
@@ -354,7 +529,12 @@ impl V8Pool {
                     Ok(Ok(permit)) => permit,
                     // The semaphore is only ever closed by shutdown.
                     Ok(Err(_)) => return Err(PoolError::Disconnected),
-                    Err(_elapsed) => return Err(PoolError::Timeout),
+                    Err(_elapsed) => {
+                        // Never even got a queue slot: the pool is the
+                        // bottleneck, and this is the counter that says so.
+                        self.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                        return Err(PoolError::Timeout);
+                    }
                 }
             }
             None => match self.slots.clone().acquire_owned().await {
@@ -370,7 +550,9 @@ impl V8Pool {
             _slot: slot,
         };
 
+        self.stats.queued.fetch_add(1, Ordering::Relaxed);
         if self.queue.push(request).is_err() {
+            self.stats.queued.fetch_sub(1, Ordering::Relaxed);
             return Err(PoolError::Disconnected);
         }
 
@@ -387,7 +569,10 @@ impl V8Pool {
                     Ok(Ok(Ok(html))) => Ok(html),
                     Ok(Ok(Err(msg))) => Err(PoolError::Render(msg)),
                     Ok(Err(_)) => Err(PoolError::WorkerCrashed),
-                    Err(_elapsed) => Err(PoolError::Timeout),
+                    Err(_elapsed) => {
+                        self.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                        Err(PoolError::Timeout)
+                    }
                 }
             }
             None => match response_rx.await {
@@ -410,6 +595,65 @@ impl V8Pool {
     /// Get the number of active workers
     pub fn worker_count(&self) -> usize {
         self.worker_count.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot of what the pool is doing right now.
+    ///
+    /// Throughput stops rising the moment every worker is busy — past that,
+    /// added concurrency turns into queue delay and nothing else. So the two
+    /// numbers to watch are [`saturation`](PoolMetrics::saturation) and
+    /// [`queue_pressure`](PoolMetrics::queue_pressure): a pool pinned at 100%
+    /// saturation with a filling queue needs more workers or fewer callers, and
+    /// there is no other signal that says which.
+    ///
+    /// The render percentiles are the other half of that: `pool_size` is chosen
+    /// against them, since a pool serves at most `workers / render_time`
+    /// requests per second whatever else is true.
+    ///
+    /// ```rust,no_run
+    /// # use rusty_ssr::SsrEngine;
+    /// # fn example(engine: &SsrEngine) {
+    /// let m = engine.pool_metrics();
+    /// if m.saturation > 90.0 && m.queue_pressure > 50.0 {
+    ///     tracing::warn!(
+    ///         busy = m.busy, workers = m.workers, queued = m.queued,
+    ///         p99 = ?m.render_p99, "SSR pool is the bottleneck"
+    ///     );
+    /// }
+    /// # }
+    /// ```
+    pub fn metrics(&self) -> PoolMetrics {
+        let s = &self.stats;
+        let counts: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|i| s.histogram[i].load(Ordering::Relaxed));
+        let renders = s.renders.load(Ordering::Relaxed);
+        let workers = self.worker_count.load(Ordering::Relaxed);
+        let busy = s.busy.load(Ordering::Relaxed);
+        let queued = s.queued.load(Ordering::Relaxed);
+        let queue_capacity = self.config.queue_capacity;
+
+        PoolMetrics {
+            workers,
+            busy,
+            queued,
+            queue_capacity,
+            renders,
+            failed: s.failed.load(Ordering::Relaxed),
+            timeouts: s.timeouts.load(Ordering::Relaxed),
+            saturation: if workers > 0 {
+                busy as f64 / workers as f64 * 100.0
+            } else {
+                0.0
+            },
+            queue_pressure: if queue_capacity > 0 {
+                (queued as f64 / queue_capacity as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            },
+            render_p50: s.percentile(&counts, renders, 50.0),
+            render_p95: s.percentile(&counts, renders, 95.0),
+            render_p99: s.percentile(&counts, renders, 99.0),
+        }
     }
 
     /// Get the pool configuration
@@ -473,6 +717,10 @@ struct WorkerSetup {
     seal_globals: bool,
     render_fn_shape: Arc<AtomicU8>,
     watchdog: Option<Arc<Watchdog>>,
+    /// Reports the outcome of loading the bundle, once, before this worker
+    /// starts serving. `V8Pool::new` waits on the other end.
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+    stats: Arc<PoolStats>,
 }
 
 /// Spawn a worker thread
@@ -488,6 +736,8 @@ fn spawn_worker(setup: WorkerSetup) {
         seal_globals,
         render_fn_shape,
         watchdog,
+        ready,
+        stats,
     } = setup;
 
     worker_count.fetch_add(1, Ordering::Relaxed);
@@ -506,12 +756,16 @@ fn spawn_worker(setup: WorkerSetup) {
             }
         }
 
-        // Initialize V8 runtime for this thread (with optional heap cap)
+        // Initialize V8 runtime for this thread (with optional heap cap).
+        // Whatever happens, say so: `V8Pool::new` is waiting to hear, and a
+        // failure reported only to the log is a failure nobody sees.
         if let Err(e) = runtime::init_runtime(&bundle, max_heap_mb, seal_globals) {
             tracing::error!("❌ Failed to initialize V8 for worker {}: {}", id, e);
             worker_count.fetch_sub(1, Ordering::Relaxed);
+            let _ = ready.send(Err(e));
             return;
         }
+        let _ = ready.send(Ok(()));
 
         // Register this worker's isolate handle with the watchdog so it can
         // terminate a runaway render from another thread.
@@ -528,6 +782,7 @@ fn spawn_worker(setup: WorkerSetup) {
                 tracing::debug!("🔴 Worker {} queue closed", id);
                 break;
             };
+            stats.queued.fetch_sub(1, Ordering::Relaxed);
 
             {
                 // Destructured so the payload can be *moved* into the render
@@ -553,6 +808,8 @@ fn spawn_worker(setup: WorkerSetup) {
                 // kill the worker thread (which would permanently shrink the
                 // pool). A caught panic becomes an error response; the worker
                 // keeps serving subsequent requests.
+                stats.busy.fetch_add(1, Ordering::Relaxed);
+                let render_started = Instant::now();
                 let result = runtime::with_runtime(|state| {
                     // Clear any stray termination flag a watchdog may have set
                     // between renders (race), so it can't abort this fresh one.
@@ -570,6 +827,8 @@ fn spawn_worker(setup: WorkerSetup) {
                     }))
                     .unwrap_or_else(|_| Err("render panicked".to_string()))
                 });
+                stats.record(render_started.elapsed(), result.is_ok());
+                stats.busy.fetch_sub(1, Ordering::Relaxed);
 
                 // Disarm the watchdog.
                 if let Some(wd) = &watchdog {
@@ -606,6 +865,7 @@ impl V8Pool {
             worker_count: Arc::new(AtomicUsize::new(0)),
             render_fn_shape: Arc::new(AtomicU8::new(0)),
             watchdog: None,
+            stats: Arc::new(PoolStats::default()),
         }
     }
 
@@ -618,5 +878,128 @@ impl V8Pool {
             request_timeout: Some(Duration::from_millis(10)),
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::*;
+
+    /// Every bucket must contain the values that map to it. This is the whole
+    /// correctness of the histogram: if `bucket_of` and `bucket_floor` disagree,
+    /// the percentiles are quietly wrong and nothing else notices.
+    #[test]
+    fn floors_and_indices_agree() {
+        for micros in 0..100_000u64 {
+            let idx = bucket_of(micros);
+            let floor = bucket_floor(idx);
+            assert!(
+                floor <= micros,
+                "{micros} µs landed in bucket {idx}, whose floor is {floor} µs"
+            );
+            if idx + 1 < HISTOGRAM_BUCKETS {
+                let next = bucket_floor(idx + 1);
+                assert!(
+                    micros < next,
+                    "{micros} µs landed in bucket {idx} but belongs at or above {next} µs"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn buckets_never_go_backwards() {
+        let mut previous = bucket_of(0);
+        for micros in 0..2_000_000u64 {
+            let idx = bucket_of(micros);
+            assert!(
+                idx >= previous,
+                "bucket index fell from {previous} to {idx} at {micros} µs"
+            );
+            previous = idx;
+        }
+    }
+
+    #[test]
+    fn floors_are_strictly_increasing() {
+        for i in 1..HISTOGRAM_BUCKETS {
+            assert!(
+                bucket_floor(i) > bucket_floor(i - 1),
+                "floor {} at index {i} does not exceed {} at {}",
+                bucket_floor(i),
+                bucket_floor(i - 1),
+                i - 1
+            );
+        }
+    }
+
+    /// Under 8 µs the histogram is exact, which is what makes a cheap render
+    /// distinguishable from a free one.
+    #[test]
+    fn small_values_are_exact() {
+        for micros in 0..8u64 {
+            assert_eq!(bucket_of(micros), micros as usize);
+            assert_eq!(bucket_floor(micros as usize), micros);
+        }
+    }
+
+    /// Four steps per octave: a reading is never more than 25% below the truth.
+    #[test]
+    fn resolution_is_within_a_quarter() {
+        for micros in [8u64, 13, 100, 999, 5_000, 250_000, 3_000_000, 60_000_000] {
+            let floor = bucket_floor(bucket_of(micros));
+            let error = (micros - floor) as f64 / micros as f64;
+            assert!(
+                error < 0.25,
+                "{micros} µs reported as {floor} µs — {:.1}% low",
+                error * 100.0
+            );
+        }
+    }
+
+    /// An absurd duration must saturate rather than index out of bounds.
+    #[test]
+    fn enormous_durations_saturate() {
+        assert!(bucket_of(u64::MAX) < HISTOGRAM_BUCKETS);
+        assert!(bucket_of(u64::MAX / 2) < HISTOGRAM_BUCKETS);
+    }
+
+    #[test]
+    fn percentiles_come_out_where_the_samples_are() {
+        let stats = PoolStats::default();
+        // 99 renders at ~1 ms, one at ~1 s: the shape of a pool with one
+        // pathological page.
+        for _ in 0..99 {
+            stats.record(Duration::from_micros(1000), true);
+        }
+        stats.record(Duration::from_millis(1000), true);
+
+        let counts: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|i| stats.histogram[i].load(Ordering::Relaxed));
+
+        let p50 = stats.percentile(&counts, 100, 50.0);
+        let p99 = stats.percentile(&counts, 100, 99.0);
+        let p100 = stats.percentile(&counts, 100, 100.0);
+
+        assert!(
+            p50 >= Duration::from_micros(750) && p50 <= Duration::from_micros(1000),
+            "p50 should sit at the 1 ms mass, got {p50:?}"
+        );
+        assert!(
+            p99 <= Duration::from_micros(1000),
+            "99 of 100 samples are at 1 ms, so p99 is too: {p99:?}"
+        );
+        assert!(
+            p100 >= Duration::from_millis(750),
+            "the outlier must still be reachable at the top, got {p100:?}"
+        );
+    }
+
+    #[test]
+    fn percentiles_of_nothing_are_zero() {
+        let stats = PoolStats::default();
+        let counts: [u64; HISTOGRAM_BUCKETS] = std::array::from_fn(|_| 0);
+        assert_eq!(stats.percentile(&counts, 0, 50.0), Duration::ZERO);
+        assert_eq!(stats.percentile(&counts, 0, 99.0), Duration::ZERO);
     }
 }

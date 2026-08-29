@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
@@ -123,3 +123,10 @@ harness = false
 [[bench]]
 name = "hotpath_benchmark"
 harness = false
+
+# An HTTP server around the engine, for benchmarking it against other SSR
+# stacks on equal terms. Needs axum, hence the feature.
+[[example]]
+name = "http_server"
+path = "examples/http_server.rs"
+required-features = ["axum-integration"]

@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.3.3
+
+### The pool can now be asked how close it is to capacity
+
+`cache_metrics()` reported eleven numbers about the cache. The pool reported
+`worker_count()`, which returns a constant. So the one operational question
+about this component — *am I about to fall over?* — had no answer, and
+`pool_size` was chosen by guessing.
+
+It matters more here than the cache metrics do, because the pool is the ceiling.
+One worker renders one page at a time, so a pool serves at most
+`workers / render_time` requests per second; throughput stops rising the moment
+every worker is busy, and every further caller becomes queue delay. Measured on
+a real Preact bundle rendering a 60 kB page: throughput flattens at
+concurrency ≈ `pool_size` and stays flat, while p50 goes 1.7 ms → 4.0 → 7.5 →
+14.9 ms as concurrency doubles past it. Nothing in the engine said so.
+
+**`SsrEngine::pool_metrics() -> PoolMetrics`**, with the pair that distinguishes
+*busy* from *losing*:
+
+- `saturation` — `busy / workers`. At 100 the pool is the bottleneck, full stop.
+- `queue_pressure` — `queued / queue_capacity`. Rising while saturation sits at
+  100 is the shape of a queue that will not drain.
+
+Below saturation the load test now prints `pool 50% busy (8/16), q=0`; past it,
+`pool 100% busy (16/16), q=40`. That is the whole diagnosis, in two numbers.
+
+Also `renders`, `failed` and `timeouts` — a timeout being the one outcome that
+never becomes a render and is therefore invisible in every other count — and
+`render_p50/p95/p99` from a histogram of four buckets per octave, which is what
+`pool_size` should actually be chosen against.
+
+**It costs nothing measurable.** Two clock reads and a few relaxed atomics per
+render: 8070/7949/8089 req/s instrumented against 7331–8396 before, on the same
+machine. That is deliberately the opposite of the decision taken for the
+fragment cache, where the clock came *off* the hot path — a cache lookup costs
+tens of nanoseconds and timing it doubled the work, while a render costs at
+least tens of microseconds. Cost is relative to the thing being measured, and
+the histogram never allocates.
+
+Sixteen tests: eight in `tests/pool_metrics.rs` driving the gauges to their
+extremes (saturation reaching exactly 100 with every worker held, queued
+requests visible while they wait and draining to nothing, a throw counted as a
+failed render rather than a timeout, a request that never got a worker counted
+as a timeout), and eight on the histogram arithmetic. Those eight caught a real
+bug on their first run: the exact sub-8 µs buckets collided with the octave
+scheme, so 8 µs and 4 µs shared a bucket and every percentile above it was
+quietly wrong.
+
+### Building an engine now means the bundle loads
+
+A bundle with a **syntax error** used to produce a successfully built
+`SsrEngine`. Each worker tried to load it, failed, logged to `tracing::error!`,
+and exited. The pool was then left with zero workers, `build_engine()` returned
+`Ok`, and every request that followed waited out the whole `request_timeout` —
+thirty seconds by default — before failing with `Render timeout`. The one fact
+that explained all of it went to a log nobody sees without a subscriber
+installed, and the error the caller got pointed at the render.
+
+In production that is: ship a bad build, the service comes up healthy, accepts
+traffic, and every request hangs for half a minute and then blames the wrong
+thing. `rusty-ssr-check` — the tool whose whole purpose is to catch this before
+a deploy — reported **`ok bundle loads`**.
+
+- **`V8Pool::new` returns `Result<Self, String>`** and waits for every worker to
+  report the outcome of loading the bundle. `SsrEngine::new` surfaces a failure
+  as `SsrError::V8Init`, carrying V8's own message and source position.
+  *Breaking* for anyone constructing a `V8Pool` directly; `SsrEngine` callers
+  see only a build that now fails when it should.
+- **A syntax error is caught in 75 ms instead of 30 s**, and the message is
+  `Uncaught SyntaxError: Unexpected identifier 'error' at <ssr-bundle>:520:43`
+  rather than `Render timeout`.
+- **The first request no longer pays for start-up.** Waiting for the workers
+  moves isolate creation and bundle compilation into `build_engine()`, where it
+  belongs: about 70 ms for a 19 kB bundle and 100 ms for a 1.7 MB one, per
+  isolate, in parallel across the pool.
+
+`tests/bundle_loading.rs` covers it: a syntax error and a top-level throw both
+fail the build with V8's message intact, the failure arrives in under five
+seconds rather than as a per-request timeout, sixteen workers report one failure
+without turning it into a long wait, and a good bundle is ready to render on the
+first call. A missing render function stays a *render* error, which is right —
+the bundle loaded, the contract was not met.
+
+Found by pointing the load test at a deliberately malformed 1.7 MB bundle. No
+unit test would have: the engine reported success, and the failure only appeared
+as a wait.
+
 ## 0.3.2
 
 ### The fragment cache could grow without limit, and now cannot
