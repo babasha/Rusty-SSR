@@ -767,3 +767,85 @@ mod json_tests {
         assert_eq!(original, restored);
     }
 }
+
+// ============================================================================
+// The render function's shape: sync vs async
+// ============================================================================
+//
+// Both are supported, and that is the problem this reports on. The engine
+// awaits whatever the render function returns, so from Rust the two are
+// indistinguishable — which lets a bundle be written against a synchronous
+// contract that was never required. The cost falls on suspense: a sync renderer
+// throws when a component suspends, so a code-split route ends up replaced by a
+// placeholder and crawlers read an empty body under a correct title. Nothing
+// errors, so the only way anyone finds out is by being told.
+#[cfg(all(test, feature = "v8-pool"))]
+mod render_fn_shape_tests {
+    use rusty_ssr::v8_pool::RenderFnShape;
+    use rusty_ssr::SsrEngine;
+
+    fn engine_for(source: &str) -> (tempfile::TempDir, SsrEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.js");
+        std::fs::write(&path, source).unwrap();
+        let engine = SsrEngine::builder()
+            .bundle_path(&path)
+            .pool_size(1)
+            .build_engine()
+            .expect("engine");
+        (dir, engine)
+    }
+
+    /// Nothing has rendered, so there is nothing observed to report. It must
+    /// not guess — reporting "sync" for a bundle that never ran would be a
+    /// diagnostic that invents its own evidence.
+    #[tokio::test]
+    async fn nothing_is_known_before_the_first_render() {
+        let (_dir, engine) = engine_for("globalThis.renderPage = () => '<p>x</p>';");
+        assert_eq!(engine.render_fn_shape(), RenderFnShape::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_plain_return_is_sync() {
+        let (_dir, engine) = engine_for("globalThis.renderPage = (url) => '<p>' + url + '</p>';");
+        let html = engine.render_uncached("/here", "{}").await.unwrap();
+        assert_eq!(html, "<p>/here</p>");
+        assert_eq!(engine.render_fn_shape(), RenderFnShape::Sync);
+    }
+
+    /// An `async` function returns a promise even when its body awaits nothing,
+    /// which is the ordinary case for a bundle that has moved to an async
+    /// renderer — so this, not just an explicit `await`, has to read as async.
+    #[tokio::test]
+    async fn an_async_function_is_async_even_with_nothing_to_await() {
+        let (_dir, engine) = engine_for("globalThis.renderPage = async (url) => '<p>' + url + '</p>';");
+        let html = engine.render_uncached("/here", "{}").await.unwrap();
+        assert_eq!(html, "<p>/here</p>");
+        assert_eq!(engine.render_fn_shape(), RenderFnShape::Async);
+    }
+
+    /// The case that actually matters: a render that suspends and resumes. A
+    /// sync renderer cannot express this at all, which is exactly why a bundle
+    /// believing the contract is sync silently gives up on code-split routes.
+    #[tokio::test]
+    async fn a_promise_that_really_waits_still_resolves() {
+        let (_dir, engine) = engine_for(
+            "globalThis.renderPage = (url) => new Promise((resolve) => { \
+               setTimeout(() => resolve('<p>' + url + '</p>'), 0); \
+             });",
+        );
+        let html = engine.render_uncached("/slow", "{}").await.unwrap();
+        assert_eq!(html, "<p>/slow</p>");
+        assert_eq!(engine.render_fn_shape(), RenderFnShape::Async);
+    }
+
+    /// A rejection has to reach Rust as an error, not as an empty page — this
+    /// is what makes an async render function as safe to adopt as a sync one.
+    #[tokio::test]
+    async fn a_rejected_promise_is_an_error_not_a_blank_page() {
+        let (_dir, engine) =
+            engine_for("globalThis.renderPage = async () => { throw new Error('boom'); };");
+        let err = engine.render_uncached("/x", "{}").await.unwrap_err();
+        assert!(format!("{err}").contains("boom"), "lost the reason: {err}");
+    }
+}

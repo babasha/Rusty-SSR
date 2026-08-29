@@ -301,7 +301,13 @@ impl SsrConfigBuilder {
     ///
     /// Default: "renderPage"
     ///
-    /// Your JS bundle should expose: `globalThis.{render_function}(url, data)`
+    /// Your JS bundle should expose: `globalThis.{render_function}(url, data)`,
+    /// returning the rendered HTML **or a Promise of it** — the engine awaits
+    /// whatever comes back, so the function is free to be `async`. That is not
+    /// a detail: a synchronous renderer throws whenever a component suspends,
+    /// so a bundle that assumes it must be sync ends up replacing every
+    /// code-split route with a placeholder and serving crawlers an empty body.
+    /// See [the render-function contract](crate::SsrEngine::render#the-render-function-contract).
     pub fn render_function<S: Into<String>>(mut self, name: S) -> Self {
         self.render_function = Some(name.into());
         self
@@ -328,10 +334,6 @@ impl SsrConfigBuilder {
         self
     }
 
-    /// Set a maximum V8 heap size per worker isolate, in megabytes
-    ///
-    /// A render exceeding the cap is terminated and returns an error
-    /// (uncached) rather than aborting the process. Omit for no limit.
     /// Delete globals the bundle did not have at startup, before every render.
     ///
     /// See [`SsrConfig::seal_globals`]. Turn it on unless your bundle

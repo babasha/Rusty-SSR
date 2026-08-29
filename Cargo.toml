@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
@@ -115,4 +115,11 @@ harness = false
 
 [[bench]]
 name = "cache_benchmark"
+harness = false
+
+# The hot paths a request actually walks. Written as the evidence for the
+# optimisations below it; see the bench's module docs for the before/after
+# recipe.
+[[bench]]
+name = "hotpath_benchmark"
 harness = false

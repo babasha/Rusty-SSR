@@ -11,27 +11,16 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::cache::{BuiltPage, CachePolicy, RenderKey};
-use rusty_ssr::SsrEngine;
+mod common;
 
-fn engine_with(source: &str) -> (tempfile::TempDir, SsrEngine) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bundle.js");
-    std::fs::write(&path, source).unwrap();
-    let engine = SsrEngine::builder()
-        .bundle_path(&path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
-    (dir, engine)
-}
+use rusty_ssr::cache::{BuiltPage, CachePolicy, RenderKey};
 
 #[tokio::test]
 async fn each_engine_renders_its_own_bundle() {
-    let (_a_dir, alpha) = engine_with(
+    let alpha = common::engine(
         r#"globalThis.renderPage = (url) => "ALPHA:" + url;"#,
     );
-    let (_b_dir, beta) = engine_with(
+    let beta = common::engine(
         r#"globalThis.renderPage = (url) => "BETA:" + url;"#,
     );
 
@@ -46,8 +35,8 @@ async fn each_engine_renders_its_own_bundle() {
 /// answered from another's.
 #[tokio::test]
 async fn each_engine_has_its_own_page_cache() {
-    let (_a_dir, alpha) = engine_with(r#"globalThis.renderPage = () => "alpha";"#);
-    let (_b_dir, beta) = engine_with(r#"globalThis.renderPage = () => "beta";"#);
+    let alpha = common::engine(r#"globalThis.renderPage = () => "alpha";"#);
+    let beta = common::engine(r#"globalThis.renderPage = () => "beta";"#);
 
     let key = RenderKey::new("/shared").variant("host", "example.test");
 
@@ -72,18 +61,12 @@ async fn each_engine_has_its_own_page_cache() {
 /// not bleed into each other either.
 #[tokio::test]
 async fn engines_keep_their_own_configuration() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("named.js");
-    std::fs::write(&path, r#"globalThis.customEntry = (url) => "custom:" + url;"#).unwrap();
-    let named = SsrEngine::builder()
-        .bundle_path(&path)
-        .pool_size(1)
-        .render_function("customEntry")
-        .page_cache(CachePolicy::Off)
-        .build_engine()
-        .unwrap();
+    let named = common::engine_with(
+        r#"globalThis.customEntry = (url) => "custom:" + url;"#,
+        |b| b.render_function("customEntry").page_cache(CachePolicy::Off),
+    );
 
-    let (_d, standard) = engine_with(r#"globalThis.renderPage = (url) => "standard:" + url;"#);
+    let standard = common::engine(r#"globalThis.renderPage = (url) => "standard:" + url;"#);
 
     assert_eq!(named.render_uncached("/a", "{}").await.unwrap(), "custom:/a");
     assert_eq!(

@@ -6,7 +6,7 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::SsrEngine;
+mod common;
 
 const BYTES_BUNDLE: &str = r#"
     globalThis.renderPage = function(url, data) {
@@ -21,15 +21,7 @@ const BYTES_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn bytes_arrive_as_a_uint8array() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("bytes.js");
-    std::fs::write(&bundle_path, BYTES_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(BYTES_BUNDLE);
 
     // Includes bytes that are not valid UTF-8 and not printable — the whole
     // point is that this needs no encoding to survive the trip.
@@ -43,15 +35,7 @@ async fn bytes_arrive_as_a_uint8array() {
 /// inside JSON it would be 120 kB, and the bundle would have to decode it.
 #[tokio::test]
 async fn a_large_payload_survives_intact() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("bytes-large.js");
-    std::fs::write(&bundle_path, BYTES_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(BYTES_BUNDLE);
 
     let payload: Vec<u8> = (0..90_000).map(|i| (i % 251) as u8).collect();
     let expected_sum: u64 = payload.iter().map(|b| *b as u64).sum();
@@ -62,20 +46,10 @@ async fn a_large_payload_survives_intact() {
 /// The JSON channel still behaves — bytes are an addition, not a replacement.
 #[tokio::test]
 async fn json_still_arrives_as_an_object() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("json.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = (url, data) =>
              (data instanceof Uint8Array) ? "bytes" : ("json:" + data.city);"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     let out = engine
         .render_uncached("/x", r#"{"city":"Blumenau"}"#)
@@ -89,10 +63,7 @@ async fn json_still_arrives_as_an_object() {
 /// base64'd on the way in or decoded on the way out.
 #[tokio::test]
 async fn a_json_envelope_and_bytes_arrive_side_by_side() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("both.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = function(url, data, bytes) {
                if (typeof data !== "object" || data === null) return "no-envelope";
                if (!(bytes instanceof Uint8Array)) return "no-bytes";
@@ -100,14 +71,7 @@ async fn a_json_envelope_and_bytes_arrive_side_by_side() {
                for (let i = 0; i < bytes.length; i++) sum += bytes[i];
                return data.city + "/" + data.page + " rows=" + bytes.length + " sum=" + sum;
            };"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     let out = engine
         .render_with_json_and_bytes(
@@ -124,19 +88,9 @@ async fn a_json_envelope_and_bytes_arrive_side_by_side() {
 /// the boundary rather than handed to the bundle.
 #[tokio::test]
 async fn a_malformed_envelope_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("strict.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = () => "should not have been called";"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     let err = engine
         .render_with_json_and_bytes("/x", "{not json", vec![1, 2, 3])
@@ -155,20 +109,10 @@ async fn a_malformed_envelope_is_refused() {
 /// An empty payload is a payload: zero-length `Uint8Array`, not `undefined`.
 #[tokio::test]
 async fn an_empty_byte_payload_is_still_a_uint8array() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("empty.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = (url, data) =>
              (data instanceof Uint8Array) ? ("bytes:" + data.length) : ("other:" + typeof data);"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     assert_eq!(
         engine.render_with_bytes("/x", Vec::new()).await.unwrap(),
@@ -181,10 +125,7 @@ async fn an_empty_byte_payload_is_still_a_uint8array() {
 /// empty page rather than an error anyone sees.
 #[tokio::test]
 async fn base64_and_screen_are_available_to_the_bundle() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("web-apis.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = () => {
                const round = atob(btoa("Blumenau · SC"));
                return [
@@ -196,14 +137,7 @@ async fn base64_and_screen_are_available_to_the_bundle() {
                    String(globalThis.screen.deviceXDPI),
                ].join("|");
            };"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     assert_eq!(
         engine.render_uncached("/", "{}").await.unwrap(),
@@ -215,22 +149,12 @@ async fn base64_and_screen_are_available_to_the_bundle() {
 /// invents bytes is worse than one that stops.
 #[tokio::test]
 async fn atob_refuses_junk() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("bad-b64.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = () => {
                try { atob("not!base64"); return "accepted junk"; }
                catch (e) { return "refused: " + e.message; }
            };"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     let out = engine.render_uncached("/", "{}").await.unwrap();
     assert!(out.starts_with("refused:"), "got: {out}");

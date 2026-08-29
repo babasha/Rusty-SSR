@@ -2,15 +2,92 @@
 
 use core_affinity::CoreId;
 use deno_core::v8::IsolateHandle;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::renderer::RenderPayload;
 use super::{renderer, runtime};
+
+/// The pool's work queue: many producers, many consumers, no lock held while
+/// waiting.
+///
+/// This job used to be done by a `std::sync::mpsc::Receiver` behind a `Mutex`,
+/// with the *blocking* `recv()` called while holding that mutex. It worked, but
+/// it meant only one worker was ever genuinely waiting on the channel and the
+/// other N−1 were parked on the lock behind it — so handing out a task was a
+/// mutex hand-off plus a wake-up chain, and the workers took their turns in
+/// lock-acquisition order rather than whichever was free.
+///
+/// Here the lock is held only for a push or a pop. Waiting happens on the
+/// condvar, which releases it, so every idle worker is genuinely idle and
+/// `notify_one` wakes exactly one of them.
+struct WorkQueue {
+    inner: Mutex<QueueInner>,
+    /// Signalled when a task arrives, and broadcast when the pool closes.
+    work: Condvar,
+}
+
+struct QueueInner {
+    tasks: VecDeque<RenderRequest>,
+    /// Set when the pool is dropped. Workers finish the queue and exit.
+    closed: bool,
+}
+
+impl WorkQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(QueueInner {
+                tasks: VecDeque::new(),
+                closed: false,
+            }),
+            work: Condvar::new(),
+        }
+    }
+
+    /// Hand a task to whichever worker wakes first. Gives the task back if the
+    /// pool has shut down.
+    fn push(&self, task: RenderRequest) -> Result<(), RenderRequest> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if inner.closed {
+            return Err(task);
+        }
+        inner.tasks.push_back(task);
+        drop(inner);
+        self.work.notify_one();
+        Ok(())
+    }
+
+    /// Wait for a task. `None` means the pool is closed and drained.
+    fn pop(&self) -> Option<RenderRequest> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if let Some(task) = inner.tasks.pop_front() {
+                return Some(task);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self
+                .work
+                .wait(inner)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Stop accepting work and wake every worker so they can notice.
+    fn close(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .closed = true;
+        self.work.notify_all();
+    }
+}
 
 /// Per-worker termination state for the render watchdog.
 struct WorkerWatch {
@@ -91,8 +168,13 @@ impl Default for V8PoolConfig {
 struct RenderRequest {
     url: String,
     data: RenderPayload,
-    render_function: String,
     response_tx: oneshot::Sender<Result<String, String>>,
+    /// This task's slot in the bounded queue, released the moment a worker
+    /// takes the task. The render function used to travel here too — a `String`
+    /// cloned per request to carry a name that is the same for the life of the
+    /// pool and is read exactly once per worker, since the resolved handle is
+    /// then cached on the isolate.
+    _slot: OwnedSemaphorePermit,
 }
 
 /// Errors returned by the V8 pool
@@ -138,14 +220,15 @@ impl std::error::Error for PoolError {}
 /// ```
 pub struct V8Pool {
     config: V8PoolConfig,
-    request_tx: mpsc::SyncSender<RenderRequest>,
-    #[allow(dead_code)]
-    request_rx: Arc<Mutex<mpsc::Receiver<RenderRequest>>>,
-    worker_count: Arc<Mutex<usize>>,
-    #[allow(dead_code)]
-    core_affinity: Option<Arc<Vec<CoreId>>>,
-    #[allow(dead_code)]
-    next_core: Arc<AtomicUsize>,
+    queue: Arc<WorkQueue>,
+    /// Free slots in the queue. Acquiring one is how a caller waits for room
+    /// instead of spinning on a full channel; a worker releases it by taking
+    /// the task.
+    slots: Arc<Semaphore>,
+    worker_count: Arc<AtomicUsize>,
+    /// What the render function last returned — a value, or a promise the
+    /// engine had to drive. Diagnostic only; see `RenderFnShape`.
+    render_fn_shape: Arc<AtomicU8>,
     /// Render watchdog (present when `request_timeout` is set).
     watchdog: Option<Arc<Watchdog>>,
 }
@@ -155,11 +238,11 @@ impl V8Pool {
     pub fn new(config: V8PoolConfig) -> Self {
         tracing::info!("🔧 Creating V8 pool with {} threads", config.num_threads);
 
-        let (request_tx, request_rx) = mpsc::sync_channel(config.queue_capacity);
-        let request_rx = Arc::new(Mutex::new(request_rx));
-        let worker_count = Arc::new(Mutex::new(0));
+        let queue = Arc::new(WorkQueue::new());
+        let slots = Arc::new(Semaphore::new(config.queue_capacity));
+        let worker_count = Arc::new(AtomicUsize::new(0));
 
-        let core_affinity = if config.pin_threads {
+        let core_affinity: Option<Arc<Vec<CoreId>>> = if config.pin_threads {
             core_affinity::get_core_ids().map(Arc::new)
         } else {
             None
@@ -183,29 +266,32 @@ impl V8Pool {
             })
         });
 
+        let render_fn_shape = Arc::new(AtomicU8::new(0));
+
         let pool = Self {
-            config: config.clone(),
-            request_tx,
-            request_rx: Arc::clone(&request_rx),
+            queue: Arc::clone(&queue),
+            slots: Arc::clone(&slots),
             worker_count: Arc::clone(&worker_count),
-            core_affinity: core_affinity.clone(),
-            next_core: Arc::new(AtomicUsize::new(0)),
+            render_fn_shape: Arc::clone(&render_fn_shape),
             watchdog: watchdog.clone(),
+            config: config.clone(),
         };
 
         // Spawn worker threads
+        let render_function: Arc<str> = Arc::from(config.render_function.as_str());
         for i in 0..config.num_threads {
-            spawn_worker(
-                i,
-                Arc::clone(&request_rx),
-                Arc::clone(&worker_count),
-                core_affinity.clone(),
-                Arc::clone(&pool.next_core),
-                config.max_heap_mb,
-                Arc::clone(&config.bundle),
-                config.seal_globals,
-                watchdog.clone(),
-            );
+            spawn_worker(WorkerSetup {
+                id: i,
+                queue: Arc::clone(&queue),
+                worker_count: Arc::clone(&worker_count),
+                core_affinity: core_affinity.clone(),
+                max_heap_mb: config.max_heap_mb,
+                bundle: Arc::clone(&config.bundle),
+                render_function: Arc::clone(&render_function),
+                seal_globals: config.seal_globals,
+                render_fn_shape: Arc::clone(&render_fn_shape),
+                watchdog: watchdog.clone(),
+            });
         }
 
         // Spawn the watchdog thread.
@@ -252,34 +338,40 @@ impl V8Pool {
         data: RenderPayload,
     ) -> Result<String, PoolError> {
         let (response_tx, response_rx) = oneshot::channel();
+        let deadline = self.config.request_timeout.map(|t| Instant::now() + t);
+
+        // Wait for room in the queue.
+        //
+        // This used to be a `try_send`/`yield_now` loop, which under sustained
+        // backpressure is a runtime thread spinning at full tilt for the whole
+        // timeout — burning exactly the CPU the workers need to drain the
+        // queue it is waiting on. Acquiring a permit parks the task instead,
+        // and it is woken by the worker that frees the slot.
+        let slot = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, self.slots.clone().acquire_owned()).await {
+                    Ok(Ok(permit)) => permit,
+                    // The semaphore is only ever closed by shutdown.
+                    Ok(Err(_)) => return Err(PoolError::Disconnected),
+                    Err(_elapsed) => return Err(PoolError::Timeout),
+                }
+            }
+            None => match self.slots.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return Err(PoolError::Disconnected),
+            },
+        };
 
         let request = RenderRequest {
             url,
             data,
-            render_function: self.config.render_function.clone(),
             response_tx,
+            _slot: slot,
         };
 
-        let deadline = self.config.request_timeout.map(|t| Instant::now() + t);
-        let mut req = request;
-
-        loop {
-            match self.request_tx.try_send(req) {
-                Ok(()) => break,
-                Err(mpsc::TrySendError::Full(r)) => {
-                    if let Some(dl) = deadline {
-                        if Instant::now() >= dl {
-                            return Err(PoolError::Timeout);
-                        }
-                    }
-                    req = r;
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(PoolError::Disconnected);
-                }
-            }
+        if self.queue.push(request).is_err() {
+            return Err(PoolError::Disconnected);
         }
 
         // Wait for the response, bounded by the same deadline that bounded
@@ -306,9 +398,18 @@ impl V8Pool {
         }
     }
 
+    /// What the render function last returned — see
+    /// [`RenderFnShape`](super::renderer::RenderFnShape).
+    ///
+    /// `Unknown` until a render has completed; the value is observed rather
+    /// than declared, so there is nothing to read before one has.
+    pub fn render_fn_shape(&self) -> super::renderer::RenderFnShape {
+        super::renderer::read_shape(&self.render_fn_shape)
+    }
+
     /// Get the number of active workers
     pub fn worker_count(&self) -> usize {
-        *self.worker_count.lock().unwrap()
+        self.worker_count.load(Ordering::Relaxed)
     }
 
     /// Get the pool configuration
@@ -320,7 +421,11 @@ impl V8Pool {
 impl Drop for V8Pool {
     fn drop(&mut self) {
         tracing::info!("🛑 Shutting down V8 pool");
-        // Channels will be dropped, workers will receive disconnect and exit.
+        // Close the queue so workers drain what is left and exit, and close the
+        // semaphore so a caller waiting for room is told the pool is gone
+        // rather than waiting for a slot nobody will ever free.
+        self.queue.close();
+        self.slots.close();
         // Signal the watchdog thread to stop.
         if let Some(wd) = &self.watchdog {
             wd.shutdown.store(true, Ordering::Relaxed);
@@ -352,31 +457,49 @@ fn spawn_watchdog(wd: Arc<Watchdog>) {
     });
 }
 
-/// Spawn a worker thread
-fn spawn_worker(
+/// Everything a worker thread needs, in one place.
+///
+/// It was ten positional arguments, which is the point at which two `Arc<...>`
+/// of the same type next to each other can be swapped without the compiler
+/// noticing.
+struct WorkerSetup {
     id: usize,
-    request_rx: Arc<Mutex<mpsc::Receiver<RenderRequest>>>,
-    worker_count: Arc<Mutex<usize>>,
+    queue: Arc<WorkQueue>,
+    worker_count: Arc<AtomicUsize>,
     core_affinity: Option<Arc<Vec<CoreId>>>,
-    next_core: Arc<AtomicUsize>,
     max_heap_mb: Option<usize>,
     bundle: Arc<str>,
+    render_function: Arc<str>,
     seal_globals: bool,
+    render_fn_shape: Arc<AtomicU8>,
     watchdog: Option<Arc<Watchdog>>,
-) {
-    // Increment worker count
-    {
-        let mut count = worker_count.lock().unwrap();
-        *count += 1;
-    }
+}
+
+/// Spawn a worker thread
+fn spawn_worker(setup: WorkerSetup) {
+    let WorkerSetup {
+        id,
+        queue,
+        worker_count,
+        core_affinity,
+        max_heap_mb,
+        bundle,
+        render_function,
+        seal_globals,
+        render_fn_shape,
+        watchdog,
+    } = setup;
+
+    worker_count.fetch_add(1, Ordering::Relaxed);
 
     thread::spawn(move || {
         tracing::debug!("🟢 V8 worker {} started", id);
 
-        // Pin to CPU core if requested
+        // Pin to CPU core if requested. Keyed on the worker's own index rather
+        // than a shared counter it races other workers to increment, so worker
+        // N lands on the same core every run.
         if let Some(cores) = core_affinity {
-            let idx = next_core.fetch_add(1, Ordering::Relaxed) % cores.len();
-            if let Some(core_id) = cores.get(idx) {
+            if let Some(core_id) = cores.get(id % cores.len()) {
                 if core_affinity::set_for_current(*core_id) {
                     tracing::debug!("📌 Worker {} pinned to core {:?}", id, core_id.id);
                 }
@@ -386,8 +509,7 @@ fn spawn_worker(
         // Initialize V8 runtime for this thread (with optional heap cap)
         if let Err(e) = runtime::init_runtime(&bundle, max_heap_mb, seal_globals) {
             tracing::error!("❌ Failed to initialize V8 for worker {}: {}", id, e);
-            let mut count = worker_count.lock().unwrap();
-            *count -= 1;
+            worker_count.fetch_sub(1, Ordering::Relaxed);
             return;
         }
 
@@ -402,26 +524,23 @@ fn spawn_worker(
 
         // Main worker loop
         loop {
-            let request = {
-                let rx = request_rx.lock().unwrap();
-                match rx.recv() {
-                    Ok(req) => Some(req),
-                    Err(_) => {
-                        tracing::debug!("🔴 Worker {} channel disconnected", id);
-                        break;
-                    }
-                }
+            let Some(req) = queue.pop() else {
+                tracing::debug!("🔴 Worker {} queue closed", id);
+                break;
             };
 
-            if let Some(req) = request {
+            {
                 // Destructured so the payload can be *moved* into the render
                 // rather than cloned. A bytes payload becomes V8's backing
                 // store directly, and cloning it here would undo exactly the
                 // copy that shape exists to avoid.
-                let RenderRequest { url, data, render_function, response_tx } = req;
+                let RenderRequest { url, data, response_tx, _slot } = req;
 
-                // Prefetch data for better cache performance
-                prefetch_data(&data);
+                // The queue slot is free the moment the task leaves the queue —
+                // it bounds the queue, not the render. Holding it until the
+                // render finished would silently turn `queue_capacity` into a
+                // concurrency limit.
+                drop(_slot);
 
                 // Arm the watchdog for this render's deadline.
                 if let Some(wd) = &watchdog {
@@ -441,7 +560,13 @@ fn spawn_worker(
                         state.runtime.v8_isolate().cancel_terminate_execution();
                     }
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        renderer::render_html(&url, data, &render_function, state)
+                        renderer::render_html(
+                            &url,
+                            data,
+                            &render_function,
+                            state,
+                            &render_fn_shape,
+                        )
                     }))
                     .unwrap_or_else(|_| Err("render panicked".to_string()))
                 });
@@ -465,41 +590,21 @@ fn spawn_worker(
         );
 
         // Decrement worker count
-        let mut count = worker_count.lock().unwrap();
-        *count -= 1;
+        worker_count.fetch_sub(1, Ordering::Relaxed);
     });
-}
-
-/// Prefetch data into CPU cache
-#[inline]
-fn prefetch_data(data: &RenderPayload) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        unsafe {
-            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(data.as_ptr() as *const i8, _MM_HINT_T0);
-        }
-    }
-
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        // No-op prefetch for other architectures
-        let _ = data.len();
-    }
 }
 
 impl V8Pool {
     /// Create a stub pool for testing (no actual V8)
     #[allow(dead_code)]
     pub fn new_stub_with(config: V8PoolConfig) -> Self {
-        let (request_tx, request_rx) = mpsc::sync_channel(config.queue_capacity);
+        let slots = Arc::new(Semaphore::new(config.queue_capacity));
         Self {
             config,
-            request_tx,
-            request_rx: Arc::new(Mutex::new(request_rx)),
-            worker_count: Arc::new(Mutex::new(0)),
-            core_affinity: None,
-            next_core: Arc::new(AtomicUsize::new(0)),
+            queue: Arc::new(WorkQueue::new()),
+            slots,
+            worker_count: Arc::new(AtomicUsize::new(0)),
+            render_fn_shape: Arc::new(AtomicU8::new(0)),
             watchdog: None,
         }
     }
@@ -510,12 +615,8 @@ impl V8Pool {
         Self::new_stub_with(V8PoolConfig {
             num_threads: 0,
             queue_capacity: 0,
-            pin_threads: false,
             request_timeout: Some(Duration::from_millis(10)),
-            render_function: "renderPage".to_string(),
-            max_heap_mb: None,
-            bundle: Arc::from(""),
-            seal_globals: false,
+            ..Default::default()
         })
     }
 }

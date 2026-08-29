@@ -40,7 +40,27 @@ struct HotEntry {
     /// than returning another key's content.
     key: Arc<str>,
     html: Arc<str>,
-    created_at: Instant,
+    /// When it was stored, and `None` when the cache has no TTL.
+    ///
+    /// Not simply an `Instant` because inserts happen on the read path — every
+    /// promotion out of the cold tier is one — and reading the monotonic clock
+    /// to fill a field nothing will ever look at is pure cost.
+    created_at: Option<Instant>,
+}
+
+/// Where a key was found. `get` and `peek` ask the same question and differ
+/// only in what they do with the answer, so the search itself lives in one
+/// place: a duplicated scan is a duplicated collision check, and the two copies
+/// disagreeing about which entries are valid is exactly the bug the full-key
+/// comparison exists to prevent.
+enum Found {
+    /// In the ultra-hot array. Already as hot as it gets.
+    UltraHot(Arc<str>),
+    /// In the LRU tier: the content, and the key handle a promotion needs.
+    Lru(Arc<str>, Arc<str>),
+    /// Nothing usable. `stale` marks an entry stored under this exact key that
+    /// is present but past its TTL, which a `&mut self` caller can drop.
+    Nothing { stale: bool },
 }
 
 impl HotCache {
@@ -63,44 +83,57 @@ impl HotCache {
         }
     }
 
-    /// Look up HTML by key hash, verifying the full key
+    /// Search both tiers without changing anything.
     ///
-    /// Checks ultra-hot array first (fastest), then the LRU map. The `key` is
-    /// compared after the hash matches, so a 64-bit collision misses rather
-    /// than returning another key's content. A hit in the LRU tier is promoted
-    /// to ultra-hot.
+    /// Ultra-hot first (a linear scan of 8), then the LRU map read with `peek`
+    /// so the search itself never disturbs LRU order. The `key` is compared
+    /// after the hash matches, so a 64-bit collision misses rather than
+    /// returning another key's content.
     #[inline(always)]
-    pub fn get(&mut self, url_hash: u64, key: &str) -> Option<Arc<str>> {
+    fn find(&self, url_hash: u64, key: &str) -> Found {
         let ttl = self.ttl;
 
-        // Tier 1: ultra-hot linear scan (only 8 entries).
+        // Tier 1: ultra-hot linear scan (only 8 entries). A key lives in
+        // exactly one tier, so a match here settles the question either way.
         for entry in self.ultra_hot.iter().flatten() {
             if entry.url_hash == url_hash && entry.key.as_ref() == key {
                 return if Self::expired(ttl, entry) {
-                    None
+                    Found::Nothing { stale: false }
                 } else {
-                    Some(Arc::clone(&entry.html))
+                    Found::UltraHot(Arc::clone(&entry.html))
                 };
             }
         }
 
-        // Tier 2: LRU map. Read without mutating order first, then act.
-        let hit = match self.lru.peek(&url_hash) {
-            Some(e) if e.key.as_ref() == key && !Self::expired(ttl, e) => {
-                Some((Arc::clone(&e.html), Arc::clone(&e.key)))
+        // Tier 2: LRU map.
+        match self.lru.peek(&url_hash) {
+            Some(e) if e.key.as_ref() == key => {
+                if Self::expired(ttl, e) {
+                    Found::Nothing { stale: true }
+                } else {
+                    Found::Lru(Arc::clone(&e.html), Arc::clone(&e.key))
+                }
             }
-            _ => None,
-        };
+            _ => Found::Nothing { stale: false },
+        }
+    }
 
-        match hit {
-            Some((html, key_arc)) => {
+    /// Look up HTML by key hash, verifying the full key
+    ///
+    /// A hit in the LRU tier is promoted to ultra-hot, and an entry found past
+    /// its TTL is dropped rather than left to be re-examined on every future
+    /// lookup.
+    #[inline(always)]
+    pub fn get(&mut self, url_hash: u64, key: &str) -> Option<Arc<str>> {
+        match self.find(url_hash, key) {
+            Found::UltraHot(html) => Some(html),
+            Found::Lru(html, key_arc) => {
                 // Promote to ultra-hot (insert de-duplicates from the LRU tier).
                 self.insert(url_hash, key_arc, Arc::clone(&html));
                 Some(html)
             }
-            None => {
-                // Drop a stale/expired entry for this exact key if present.
-                if matches!(self.lru.peek(&url_hash), Some(e) if e.key.as_ref() == key) {
+            Found::Nothing { stale } => {
+                if stale {
                     self.lru.pop(&url_hash);
                 }
                 None
@@ -111,21 +144,9 @@ impl HotCache {
     /// Look up without promotion (for read-only access)
     #[inline(always)]
     pub fn peek(&self, url_hash: u64, key: &str) -> Option<Arc<str>> {
-        let ttl = self.ttl;
-
-        for entry in self.ultra_hot.iter().flatten() {
-            if entry.url_hash == url_hash && entry.key.as_ref() == key {
-                return if Self::expired(ttl, entry) {
-                    None
-                } else {
-                    Some(Arc::clone(&entry.html))
-                };
-            }
-        }
-
-        match self.lru.peek(&url_hash) {
-            Some(e) if e.key.as_ref() == key && !Self::expired(ttl, e) => Some(Arc::clone(&e.html)),
-            _ => None,
+        match self.find(url_hash, key) {
+            Found::UltraHot(html) | Found::Lru(html, _) => Some(html),
+            Found::Nothing { .. } => None,
         }
     }
 
@@ -147,7 +168,7 @@ impl HotCache {
             url_hash,
             key,
             html,
-            created_at: Instant::now(),
+            created_at: self.ttl.map(|_| Instant::now()),
         };
 
         // Place into the ultra-hot ring; demote the slot's previous occupant to
@@ -163,7 +184,10 @@ impl HotCache {
     #[inline(always)]
     fn expired(ttl: Option<Duration>, entry: &HotEntry) -> bool {
         match ttl {
-            Some(t) => entry.created_at.elapsed() > t,
+            // `created_at` is only recorded when there is a TTL to check it
+            // against, so an entry without one predates the TTL being set and
+            // is treated as fresh rather than as instantly stale.
+            Some(t) => entry.created_at.is_some_and(|at| at.elapsed() > t),
             None => false,
         }
     }

@@ -22,10 +22,16 @@ use crate::error::{SsrError, SsrResult};
 /// std::fs::write("prelude.js", rusty_ssr::v8_pool::BROWSER_POLYFILLS).unwrap();
 /// ```
 ///
-/// Two things it deliberately does **not** define, so a bundle can
+/// One thing it deliberately does **not** define, so a bundle can
 /// feature-detect rather than receive a wrong implementation:
-/// `TextEncoder`/`TextDecoder`, and `atob`/`btoa`. If you are reaching for
-/// base64 to move bytes into a render, prefer
+/// `TextEncoder`/`TextDecoder`. A wrong UTF-8 implementation is worse than an
+/// absent one.
+///
+/// `atob`/`btoa` *are* defined, because a bundle that hits a missing `atob`
+/// throws, and on this path a throw usually means a blank page rather than an
+/// error anyone sees. They are for code that has base64 in it for its own
+/// reasons — a JWT payload, a `data:` URL. If you are reaching for base64 to
+/// move a *payload* into a render, prefer
 /// [`render_with_bytes`](crate::SsrEngine::render_with_bytes) — it hands the
 /// bundle a `Uint8Array` and there is nothing to decode.
 pub const BROWSER_POLYFILLS: &str = r#"
@@ -551,13 +557,13 @@ globalThis.__rustySsrReset = function (url) {
 /// Read a bundle from disk and prepend the prelude, without touching any global
 /// state.
 ///
-/// This is what [`SsrEngine`](crate::SsrEngine) uses. The `init_bundle*`
-/// functions above put the composed source in a process-global `OnceLock`, and
-/// that global is why two engines could never have two different bundles: the
-/// second `init` quietly returned the first one's source, so the second engine
-/// rendered with the wrong code. It also meant a test file could hold only one
-/// bundle however many cases it had, which is a strange thing for a library to
-/// impose on the people testing against it.
+/// This is what [`SsrEngine`](crate::SsrEngine) uses. It replaced a pair of
+/// `init_bundle*` functions that put the composed source in a process-global
+/// `OnceLock`, and that global is why two engines could never have two
+/// different bundles: the second `init` quietly returned the first one's
+/// source, so the second engine rendered with the wrong code. It also meant a
+/// test file could hold only one bundle however many cases it had, which is a
+/// strange thing for a library to impose on the people testing against it.
 ///
 /// The composed string is handed to the pool, which hands it to each worker.
 /// Nothing is shared between engines.

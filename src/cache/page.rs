@@ -30,6 +30,7 @@
 //! [stale-while-revalidate](CachePolicy::stale_while_revalidate) so a hot key
 //! never makes anyone wait for a rebuild.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -202,6 +203,22 @@ impl RenderKey {
         &self.url
     }
 
+    /// The string this page is stored under, borrowed when it can be.
+    ///
+    /// A key with no variants *is* its URL, so a lookup can use the URL the
+    /// caller already owns instead of copying it. That covers the plain
+    /// `RenderKey::new(path)` case entirely, and a page-cache hit is supposed
+    /// to be the cheapest thing the engine does — an allocation to build a
+    /// string identical to one already in hand is a strange thing to spend it
+    /// on.
+    fn key_ref(&self) -> Cow<'_, str> {
+        if self.variants.is_empty() {
+            Cow::Borrowed(&self.url)
+        } else {
+            Cow::Owned(self.cache_key())
+        }
+    }
+
     /// The string this page is stored under.
     fn cache_key(&self) -> String {
         if self.variants.is_empty() {
@@ -350,14 +367,24 @@ impl PageCache {
     /// knows how to rebuild. Reach for this directly only when you have no
     /// build step to offer.
     pub fn get(&self, key: &RenderKey) -> Option<CachedPage> {
+        self.get_by_key(&key.key_ref())
+    }
+
+    /// [`get`](Self::get), for a caller that already has the composed key.
+    ///
+    /// Building that key means sorting the variants and allocating a string,
+    /// and a single request used to do it three or four times over — once to
+    /// look up, once to claim a refresh, once for single-flight, once to store
+    /// — producing the identical string each time. Every step now takes the
+    /// one that was built at the top of the request.
+    fn get_by_key(&self, cache_key: &str) -> Option<CachedPage> {
         let (ttl, swr) = match self.policy {
             CachePolicy::Off => return None,
             CachePolicy::Keep { ttl, stale_while_revalidate, .. } => (ttl, stale_while_revalidate),
         };
-        let cache_key = key.cache_key();
         let mut guard = self.entries.lock().ok()?;
         let entries = guard.as_mut()?;
-        let entry = entries.get(&cache_key)?;
+        let entry = entries.get(cache_key)?;
         let age = entry.stored_at.elapsed();
 
         let stale = match ttl {
@@ -369,7 +396,7 @@ impl PageCache {
                 // re-examined on every future lookup.
                 let window = swr.unwrap_or_default();
                 if age > ttl + window {
-                    entries.pop(&cache_key);
+                    entries.pop(cache_key);
                     return None;
                 }
                 true
@@ -390,12 +417,17 @@ impl PageCache {
     ///
     /// Under [`CachePolicy::Off`] this stores nothing and just converts.
     pub fn store(&self, key: &RenderKey, page: BuiltPage) -> CachedPage {
+        self.store_at(key.cache_key(), page)
+    }
+
+    /// [`store`](Self::store), for a caller that already has the composed key.
+    fn store_at(&self, cache_key: String, page: BuiltPage) -> CachedPage {
         let BuiltPage { status, body, headers } = page;
         let body = Bytes::from(body);
         if let Ok(mut guard) = self.entries.lock() {
             if let Some(entries) = guard.as_mut() {
                 entries.put(
-                    key.cache_key(),
+                    cache_key,
                     Entry {
                         status,
                         body: body.clone(),
@@ -480,29 +512,46 @@ impl PageCache {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = SsrResult<BuiltPage>> + Send + 'static,
     {
-        if let Some(page) = self.get(key) {
-            if !page.stale {
+        // Composed once and handed to every step below. See
+        // [`get_by_key`](Self::get_by_key) for what this used to cost. Borrowed
+        // rather than built when the key has no variants, so a hit -- the case
+        // this method exists to make fast -- allocates nothing at all.
+        //
+        // Scoped, and deliberately so. Everything a hit touches is confined to
+        // this block, which returns before the function's only `await`, so none
+        // of it becomes part of the future this method compiles into. A `Cow`
+        // left alive across that await would be carried by every poll of it,
+        // including the polls of the hit path that never needed it.
+        let cache_key = {
+            let cache_key = key.key_ref();
+
+            if let Some(page) = self.get_by_key(&cache_key) {
+                if !page.stale {
+                    return Ok(page);
+                }
+                // Stale but serveable. Start at most one rebuild behind it and
+                // answer now — the whole point of the window is that nobody waits.
+                if self.claim_refresh(&cache_key) {
+                    let cache = Arc::clone(self);
+                    let url = key.url().to_string();
+                    let cache_key = cache_key.into_owned();
+                    tokio::spawn(async move { cache.refresh(cache_key, url, build).await });
+                }
                 return Ok(page);
             }
-            // Stale but serveable. Start at most one rebuild behind it and
-            // answer now — the whole point of the window is that nobody waits.
-            if self.claim_refresh(key) {
-                let cache = Arc::clone(self);
-                let key = key.clone();
-                tokio::spawn(async move { cache.refresh(key, build).await });
-            }
-            return Ok(page);
-        }
 
-        self.build_single_flight(key, build).await
+            cache_key.into_owned()
+        };
+
+        self.build_single_flight(cache_key, build).await
     }
 
     /// Mark the entry as being refreshed, returning false if someone already
     /// had. Keeps a burst of stale hits down to one rebuild.
-    fn claim_refresh(&self, key: &RenderKey) -> bool {
+    fn claim_refresh(&self, cache_key: &str) -> bool {
         let Ok(mut guard) = self.entries.lock() else { return false };
         let Some(entries) = guard.as_mut() else { return false };
-        match entries.peek_mut(&key.cache_key()) {
+        match entries.peek_mut(cache_key) {
             Some(entry) if !entry.refreshing => {
                 entry.refreshing = true;
                 true
@@ -516,10 +565,10 @@ impl PageCache {
     /// replacement is not refreshing. Without this a single failed rebuild
     /// would leave the key marked forever and no later request would ever try
     /// again — it would serve the stale page until the entry was evicted.
-    fn release_refresh(&self, key: &RenderKey) {
+    fn release_refresh(&self, cache_key: &str) {
         if let Ok(mut guard) = self.entries.lock() {
             if let Some(entries) = guard.as_mut() {
-                if let Some(entry) = entries.peek_mut(&key.cache_key()) {
+                if let Some(entry) = entries.peek_mut(cache_key) {
                     entry.refreshing = false;
                 }
             }
@@ -532,32 +581,34 @@ impl PageCache {
     /// the stale page the visitor already received is a better answer than any
     /// error this could raise. The claim is released so the next stale hit
     /// tries again.
-    async fn refresh<F, Fut>(&self, key: RenderKey, build: F)
+    async fn refresh<F, Fut>(&self, cache_key: String, url: String, build: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = SsrResult<BuiltPage>> + Send,
     {
         match build().await {
             Ok(page) => {
-                self.store(&key, page);
-                tracing::debug!(url = key.url(), "revalidated stale page");
+                self.store_at(cache_key, page);
+                tracing::debug!(url = %url, "revalidated stale page");
             }
             Err(e) => {
-                tracing::warn!(url = key.url(), error = %e, "stale revalidation failed");
-                self.release_refresh(&key);
+                tracing::warn!(url = %url, error = %e, "stale revalidation failed");
+                self.release_refresh(&cache_key);
             }
         }
     }
 
     /// Run `build` unless another caller is already building this key, in which
     /// case wait for theirs.
-    async fn build_single_flight<F, Fut>(&self, key: &RenderKey, build: F) -> SsrResult<CachedPage>
+    async fn build_single_flight<F, Fut>(
+        &self,
+        cache_key: String,
+        build: F,
+    ) -> SsrResult<CachedPage>
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = SsrResult<BuiltPage>> + Send,
     {
-        let cache_key = key.cache_key();
-
         // Either become the builder, or subscribe to the one that exists.
         let follower = {
             let mut inflight = self
@@ -583,7 +634,7 @@ impl PageCache {
                 // from the cache if the leader got far enough to store, and
                 // otherwise say so rather than hanging.
                 Err(_) => self
-                    .get(key)
+                    .get_by_key(&cache_key)
                     .ok_or_else(|| SsrError::Cache("page build was abandoned".into())),
             };
         }
@@ -603,7 +654,7 @@ impl PageCache {
 
         let built = build().await;
         let result = match built {
-            Ok(page) => Ok(self.store(key, page)),
+            Ok(page) => Ok(self.store_at(cache_key.clone(), page)),
             Err(e) => Err(e),
         };
 

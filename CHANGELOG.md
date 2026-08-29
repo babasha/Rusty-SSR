@@ -1,5 +1,213 @@
 # Changelog
 
+## 0.3.1
+
+### The render function may be async, and now it says so
+
+Nothing changed in the engine: `render_html` has always driven whatever the
+render function returned to completion, and every example bundle and
+integration test in this repository declares `renderPage` as `async`. What
+changed is that the fact was stated only in the README, and a consumer reading
+the *signature* — `render_uncached(&self, url, data) -> SsrResult<String>` — has
+no way to tell.
+
+That gap is expensive, because sync-versus-async is really the suspense
+question. A synchronous renderer throws whenever a component suspends, and a
+code-split route awaiting its chunk is the ordinary case. A bundle that believes
+the contract is synchronous therefore has to swap every lazy route for a
+placeholder, and then serves crawlers an empty body under a correct-looking
+`<title>` — no error, no log, nothing that fails. It was found in a consumer
+whose most SEO-valuable page type, the one its own sitemap lists, had been
+shipping an empty `<div>` on the strength of one wrong code comment.
+
+- **`SsrEngine::render` grew a "render-function contract" section** covering all
+  three shapes, what a rejected promise does (an `Err`, exactly like a
+  synchronous throw), and the cost — the worker thread is occupied for the whole
+  await, so awaiting real I/O saturates a `pool_size` pool far sooner than
+  awaiting a microtask. `render_uncached` and `render_function` link to it.
+- **`SsrEngine::render_fn_shape() -> RenderFnShape`** — `Sync`, `Async`, or
+  `Unknown` before anything has rendered. Observed at the one point in the
+  process where the answer exists (the returned V8 value, before it is
+  resolved), and deliberately not something to branch on: both shapes render
+  correctly and the engine treats them identically. It exists to be reported.
+- **`rusty-ssr-check` reports it.** Async passes with a note; sync prints what a
+  synchronous render function costs a code-splitting bundle. Never a failure —
+  a bundle that splits nothing has no reason to be async.
+
+Five tests cover it, including a promise resolved from a `setTimeout` (so the
+event loop is genuinely driven, not merely microtasks drained) and a rejection
+arriving as an `Err` rather than as a blank page.
+
+### Payload delivery, and a prototype-pollution hole closed with it
+
+A JSON payload used to reach the bundle by being parsed twice: `serde_json`
+built a `serde_json::Value` — a Rust tree nobody ever read, with an allocation
+per string, array and object — and `serde_v8` then walked that tree to build the
+V8 objects the bundle actually receives. It goes to `v8::json::parse` now, which
+does it in one pass inside the isolate and validates while it is there.
+
+The second parse was not only slow, it was **the wrong way to build objects from
+untrusted input**. Assigning an object's keys one at a time means `__proto__`
+goes through the prototype setter, so a payload containing
+`{"__proto__": {"x": 1}}` wrote to `Object.prototype` — for every later render
+on that worker, for every visitor it served. `JSON.parse` semantics, which V8's
+parser implements, make `__proto__` an ordinary own property. Payloads are
+attacker-influenced on any page that echoes user input, so this was reachable.
+
+- **A 60 kB envelope is delivered about three times faster** — 966 µs → 300 µs
+  end to end, render included, reproduced within three points across three
+  independent runs. Small payloads are unchanged, as expected: there the
+  measurement is cross-thread dispatch, not conversion.
+- `tests/render_payload_fidelity.rs` — 19 tests pinning what crosses into the
+  bundle: every JSON type keeps its JavaScript type, numbers keep their values,
+  non-ASCII and escapes survive, deep nesting survives, a 400-row payload
+  arrives complete, malformed input is refused with a message that says so, a
+  worker still renders after refusing one, and `__proto__`/`constructor` keys
+  are data rather than reaching the prototype.
+
+### The fragment cache stopped paying for its own instrumentation
+
+- **The clock came off the hit path.** Every `try_get` called `Instant::now()`
+  to fill `CacheMetrics::last_access_ns` — tens of nanoseconds to time a lookup
+  documented as taking one to three, and on a miss the reading was taken and
+  then thrown away. One lookup in 256 is timed now. The field is a latency
+  gauge, and a sample says what the population does.
+- **`insert` stopped counting the whole map.** It called `DashMap::len()` — a
+  sum over all 128 shards — on every insert, purely to ask whether it was full.
+  The count is maintained alongside the map instead.
+- **Reads stopped writing to a shared counter.** The LRU stamp came from a
+  `fetch_add` on one global atomic, so every read from any core bounced that
+  cache line — on the read path, in a read-mostly structure, which is precisely
+  what 128 shards were there to avoid. Readers *load* a clock that only inserts
+  advance. Eviction is therefore "least recently used, to the nearest insert",
+  which is the granularity at which the answer is used anyway.
+- **Two `Arc`s that nothing ever cloned** became plain fields, and
+  `HotCache::get`/`peek` stopped keeping two copies of the same two-tier search.
+
+Every lookup and insert measured is faster, in every run, by margins between a
+third and two thirds — a hot hit goes from 139 ns to somewhere between 42 and
+69 ns depending on the run, an insert from 1.2 µs to 0.4–0.5 µs, and concurrent
+readers gain 19–49% at one, four and eight threads. The spread is the rig, not
+the change: see the note on the benchmark below.
+
+`tests/cache_semantics.rs` — 16 tests stating what the cache promises without
+reference to its tiers, including that its reported size never drifts from
+reality (overwrites, invalidations, prefix invalidations, clears, concurrent
+inserts of the same keys) and that a working set which is read survives churn.
+
+### The page cache hit stopped rebuilding its own key
+
+`RenderKey` was composed into its string three or four times per request — once
+to look up, once to claim a refresh, once for single-flight, once to store —
+sorting the variants and allocating afresh each time to produce the identical
+string. It is composed once now, and borrowed rather than built at all when the
+key has no variants.
+
+Strictly less work per request — three or four fewer sorts and allocations, and
+none at all for a key without variants — but this tier's benchmarks sit at a few
+hundred nanoseconds, which is below what this machine can resolve. No figure is
+quoted because none survived the noise check.
+
+### The pool hands out work without a lock convoy
+
+Workers shared one `std::sync::mpsc::Receiver` behind a `Mutex`, and called the
+*blocking* `recv()` while holding it. Only one worker was ever really waiting;
+the rest were queued on the lock, so every task handed out cost a mutex
+hand-off and a wake-up chain, and the workers took their turns in
+lock-acquisition order rather than whichever was free. The queue is a `VecDeque`
+with a condvar now: the lock is held for a push or a pop, never across a wait.
+
+Backpressure changed with it. A full queue used to spin on `try_send` +
+`yield_now()` until the request's deadline — a runtime thread at full tilt for
+the whole timeout, burning the CPU the workers needed to drain the queue it was
+waiting on. Callers wait on a semaphore permit and are woken by the worker that
+frees the slot. A worker releases its slot when it *takes* the task, so
+`queue_capacity` still bounds the queue and not the concurrency.
+
+Also: the render-function name is no longer a `String` cloned into every request
+(it is fixed for the life of the pool, and read once per worker, since the
+resolved handle is then cached on the isolate); `worker_count` is an atomic
+rather than a mutex; core pinning is keyed on the worker's own index rather than
+a counter the workers race to increment; the per-render `Vec` of V8 arguments is
+gone; and `prefetch_data` — which prefetched one cache line before a
+millisecond-long render, and whose `cfg` named `core::arch::x86_64` on 32-bit
+x86 — is gone with it.
+
+64 concurrent renders came out 5–10% faster in both clean runs, through one
+worker and through four. That is inside this machine's noise floor, so treat it
+as a direction rather than a number; what is certain is that the work removed —
+a mutex hand-off per task, and a spinning thread under backpressure — is work
+that is no longer done.
+
+`tests/pool_queue.rs` — 9 tests: no request is answered with another request's
+page across 400 concurrent callers, every request is delivered exactly once, a
+one-slot queue does not serialise four workers, backpressure resolves on
+schedule and lifts afterwards, and a throwing render leaves its worker usable.
+
+### Template assembly walks the document once per placeholder, not once per pair
+
+The single-pass scan re-searched *every* placeholder across the rest of the
+document after *every* substitution — k·m passes over the whole page for k
+placeholders and m matches. Each placeholder's next position is now found once
+and re-derived only when the cursor passes it; "no more occurrences" is
+remembered rather than re-discovered.
+
+Measured within a single run, so machine drift cannot flatter it: assembling a
+600 kB document with five placeholders used to cost 5.9× what one placeholder
+cost, and now costs 3.3×. In wall-clock terms, 700 µs → 390 µs, while the
+one-placeholder case stays at 119 µs in both — which is the arithmetic working
+out, since with one placeholder there was never a second pass to save.
+
+`tests/template_assembly.rs` — 14 tests, including the property that makes
+single-pass assembly worth having: a rendered fragment containing the literal
+text of another placeholder is emitted verbatim. Chained `String::replace` gets
+that wrong, and on any page that echoes user input the fragment is
+attacker-influenced.
+
+### Brotli middleware
+
+- **Compression moved off the runtime thread.** It ran inline, so for the whole
+  of a large page it blocked every other task that thread was driving — on a
+  single-threaded runtime, the accept loop included.
+- **A response that is already encoded is left alone.** Sitting above a
+  `tower-http` compression layer, this produced a body that had been through
+  brotli twice under a header claiming once, which no client can undo.
+- **A blocking `Path::exists()` came out of an async function.** It was also
+  redundant: the read that follows answers the same question in one syscall,
+  without a window in between for the answer to change.
+- **Buffering is bounded** at 32 MiB rather than `usize::MAX`.
+- The two doctests in this module never compiled. They do now.
+
+Eleven tests, where there were none.
+
+### Documentation that had drifted from the code
+
+- Four places said the prelude ships no `atob`/`btoa`. It has shipped both since
+  0.3.0.
+- `compose()` described "the `init_bundle*` functions above", which 0.3.0
+  removed.
+- `seal_globals` opened with four lines documenting `max_heap_mb`.
+
+### Tests
+
+`tests/common/mod.rs` — the tempdir-plus-bundle-plus-engine preamble was written
+out about thirty times across eight files. It holds the temporary directory
+alongside the engine, which two of those copies had been dropping early and
+getting away with only because the bundle happens to be read once, at build
+time.
+
+`benches/hotpath_benchmark.rs` — the paths a request actually walks, measured
+through the public API. Every figure quoted above comes from it; the module docs
+carry the before/after recipe.
+
+**On trusting its numbers.** Run the same unchanged code twice and criterion
+will report a 32% improvement, with `p = 0.00`, because a developer laptop's
+clock speed depends on how warm it is. Anything under about a third is therefore
+a statement about the machine and not about the code, which is why some sections
+above quote a range, and some quote nothing at all. The figures that are quoted
+either clear that bar by a wide margin and reproduce across independent runs, or
+come from comparing two benchmarks inside a single run, where the drift cancels.
+
 ## 0.3.0
 
 ### Request isolation, as far as this stack allows

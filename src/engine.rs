@@ -135,11 +135,6 @@ impl HtmlTemplate {
         Ok(ManifestEntry { file, css })
     }
 
-    /// Inject rendered HTML fragment into the template
-    fn inject(&self, fragment: &str) -> String {
-        multi_replace(&self.content, &[("<!--ssr:outlet-->", fragment)])
-    }
-
     /// Assemble the final document in a single pass: the rendered fragment
     /// goes into `<!--ssr:outlet-->`, and each caller-supplied placeholder is
     /// replaced in the same left-to-right scan. One allocation, and
@@ -167,36 +162,63 @@ fn multi_replace(template: &str, replacements: &[(&str, &str)]) -> String {
         .sum();
     let mut out = String::with_capacity(template.len() + extra);
 
-    let mut cursor = 0;
-    while cursor < template.len() {
-        // Find the earliest next occurrence of any needle at/after `cursor`.
-        let mut best: Option<(usize, &str, &str)> = None;
-        for &(needle, value) in replacements {
+    // Where each needle next occurs, found once up front.
+    //
+    // The scan used to re-search *every* needle across the rest of the template
+    // after *every* substitution, which for k placeholders and m matches walks
+    // the document k·m times — on a page with five placeholders that is five
+    // full passes over the whole document per placeholder found. A needle's
+    // position only stops being valid when the cursor passes it, so almost all
+    // of that searching was re-deriving answers already in hand.
+    let mut next: Vec<Option<usize>> = replacements
+        .iter()
+        .map(|&(needle, _)| {
             if needle.is_empty() {
-                continue;
+                // An empty needle matches everywhere and would never advance
+                // the cursor. Ignored, as it always was.
+                None
+            } else {
+                template.find(needle)
             }
-            if let Some(rel) = template[cursor..].find(needle) {
-                let pos = cursor + rel;
-                match best {
-                    Some((bpos, _, _)) if bpos <= pos => {}
-                    _ => best = Some((pos, needle, value)),
+        })
+        .collect();
+
+    let mut cursor = 0;
+    loop {
+        // Earliest match wins; a tie goes to whichever needle was listed first.
+        let mut best: Option<(usize, usize)> = None; // (position, index)
+        for (i, pos) in next.iter().enumerate() {
+            if let Some(&p) = pos.as_ref() {
+                if best.is_none_or(|(bp, _)| p < bp) {
+                    best = Some((p, i));
                 }
             }
         }
 
-        match best {
-            Some((pos, needle, value)) => {
-                out.push_str(&template[cursor..pos]);
-                out.push_str(value);
-                cursor = pos + needle.len();
-            }
-            None => {
-                out.push_str(&template[cursor..]);
-                break;
+        let Some((pos, i)) = best else { break };
+        let (needle, value) = replacements[i];
+
+        out.push_str(&template[cursor..pos]);
+        out.push_str(value);
+        cursor = pos + needle.len();
+
+        // Only the needles the cursor has just passed need looking up again —
+        // the one consumed, plus any that overlapped it. Everything else still
+        // points at a match that is still ahead.
+        //
+        // `None` is final, not "unknown": a needle with no occurrence at or
+        // after some cursor has none at any later cursor either, because the
+        // cursor only moves forward. Re-searching those would put the k·m
+        // scanning straight back in for every placeholder already exhausted.
+        for (j, slot) in next.iter_mut().enumerate() {
+            if slot.is_some_and(|p| p < cursor) {
+                let needle_j = replacements[j].0;
+                *slot = template[cursor..].find(needle_j).map(|rel| cursor + rel);
             }
         }
     }
 
+    out.push_str(&template[cursor..]);
     out
 }
 
@@ -309,6 +331,44 @@ impl SsrEngine {
     /// let html = engine.render("/home").await.unwrap();
     /// # }
     /// ```
+    ///
+    /// # The render-function contract
+    ///
+    /// **The render function may be `async`, and this is the single most
+    /// consequential thing to know about it.** The engine drives whatever the
+    /// function returns to completion before handing you the result, so all
+    /// three of these are supported and behave identically from Rust:
+    ///
+    /// ```js
+    /// globalThis.renderPage = (url, data) => renderToString(<App />);
+    /// globalThis.renderPage = async (url, data) => await renderToStringAsync(<App />);
+    /// globalThis.renderPage = (url, data) => somethingReturningAPromise();
+    /// ```
+    ///
+    /// A rejected promise becomes [`SsrError::JsExecution`](crate::SsrError)
+    /// with the rejection's message, exactly like a synchronous throw.
+    ///
+    /// This matters more than it sounds, because the sync/async question is
+    /// really the suspense question. Every major framework's *synchronous*
+    /// renderer throws when a component suspends — a code-split route awaiting
+    /// its chunk is the ordinary case — and the usual response is a `try/catch`
+    /// returning `""`. That ships a blank page under a 200 status, and it is
+    /// why [`min_render_bytes`](crate::SsrConfigBuilder::min_render_bytes)
+    /// exists. The better answer is the framework's async renderer, and it has
+    /// always been available here:
+    /// `renderToStringAsync`, `renderToPipeableStream`'s promise form,
+    /// `renderToStringAsync` in Solid, and so on.
+    ///
+    /// What it costs: the worker thread is occupied for the whole await. The
+    /// pool is `pool_size` isolates and a blocked worker is not serving anyone
+    /// else, so an `await` on real I/O — a database, an HTTP call — will
+    /// saturate the pool far sooner than an `await` that settles in a
+    /// microtask. Bundlers that inline dynamic imports (Vite's
+    /// `inlineDynamicImports`, Rollup's single-file output) turn a lazy route
+    /// into the microtask case, which is what makes async rendering cheap for
+    /// the code-splitting scenario specifically. Set
+    /// [`request_timeout`](crate::SsrConfigBuilder::request_timeout)
+    /// accordingly — the default of 30 s is a library's default, not a page's.
     #[cfg(all(feature = "v8-pool", feature = "cache"))]
     pub async fn render(&self, url: &str) -> SsrResult<Arc<str>> {
         self.render_with_data(url, "{}").await
@@ -335,12 +395,11 @@ impl SsrEngine {
         // Cache miss - render via V8
         tracing::debug!("Cache miss, rendering: {}", url);
 
-        let html = self
-            .v8_pool
-            .render_with_data(url.to_string(), data.to_string())
-            .await
-            .map_err(Self::map_pool_error)
-            .and_then(|html| self.guard_empty(html))?;
+        let html = self.finish(
+            self.v8_pool
+                .render_with_data(url.to_string(), data.to_string())
+                .await,
+        )?;
 
         let html: Arc<str> = Arc::from(html.as_str());
 
@@ -406,12 +465,7 @@ impl SsrEngine {
     /// Render a URL with data and inject into the HTML template
     #[cfg(all(feature = "v8-pool", feature = "cache"))]
     pub async fn render_to_html_with_data(&self, url: &str, data: &str) -> SsrResult<String> {
-        let fragment = self.render_with_data(url, data).await?;
-
-        match &self.template {
-            Some(tmpl) => Ok(tmpl.inject(&fragment)),
-            None => Ok(fragment.to_string()),
-        }
+        self.render_to_html_with_replacements(url, data, &[]).await
     }
 
     /// Render a URL and assemble the final document in a single pass,
@@ -462,13 +516,18 @@ impl SsrEngine {
     }
 
     /// Render without caching (always hits V8)
+    ///
+    /// The render function may be `async` — see [the render-function
+    /// contract](Self::render#the-render-function-contract), which is the
+    /// difference between a code-split route rendering and it shipping a blank
+    /// body.
     #[cfg(feature = "v8-pool")]
     pub async fn render_uncached(&self, url: &str, data: &str) -> SsrResult<String> {
-        self.v8_pool
-            .render_with_data(url.to_string(), data.to_string())
-            .await
-            .map_err(Self::map_pool_error)
-            .and_then(|html| self.guard_empty(html))
+        self.finish(
+            self.v8_pool
+                .render_with_data(url.to_string(), data.to_string())
+                .await,
+        )
     }
 
     /// Render without caching, handing the bundle raw bytes.
@@ -477,8 +536,9 @@ impl SsrEngine {
     /// no copy on the Rust side, no decoding on the JS side. Reach for this
     /// whenever the data is genuinely binary (protobuf, MessagePack, an image):
     /// the alternative is base64 inside JSON, which costs a third more bytes on
-    /// the way in *and* obliges the bundle to carry its own `atob`, since the
-    /// prelude deliberately ships none.
+    /// the way in *and* costs a base64 decode inside V8 on every render, which
+    /// for a payload of any size is milliseconds spent undoing an encoding that
+    /// existed only to fit the argument list.
     ///
     /// Uncached by design: bytes are a payload, and whether a payload belongs
     /// in a cache key is a question only the caller can answer — see
@@ -500,11 +560,7 @@ impl SsrEngine {
     /// ```
     #[cfg(feature = "v8-pool")]
     pub async fn render_with_bytes(&self, url: &str, data: Vec<u8>) -> SsrResult<String> {
-        self.v8_pool
-            .render_with_bytes(url.to_string(), data)
-            .await
-            .map_err(Self::map_pool_error)
-            .and_then(|html| self.guard_empty(html))
+        self.finish(self.v8_pool.render_with_bytes(url.to_string(), data).await)
     }
 
     /// Render without caching, with a JSON envelope AND a binary payload: the
@@ -540,11 +596,11 @@ impl SsrEngine {
         json: &str,
         bytes: Vec<u8>,
     ) -> SsrResult<String> {
-        self.v8_pool
-            .render_with_json_and_bytes(url.to_string(), json.to_string(), bytes)
-            .await
-            .map_err(Self::map_pool_error)
-            .and_then(|html| self.guard_empty(html))
+        self.finish(
+            self.v8_pool
+                .render_with_json_and_bytes(url.to_string(), json.to_string(), bytes)
+                .await,
+        )
     }
 
     /// Render without caching with JSON data
@@ -583,17 +639,24 @@ impl SsrEngine {
         data: &str,
         replacements: &[(&str, &str)],
     ) -> SsrResult<String> {
-        let fragment = self
-            .v8_pool
-            .render_with_data(url.to_string(), data.to_string())
-            .await
-            .map_err(Self::map_pool_error)
-            .and_then(|html| self.guard_empty(html))?;
+        let fragment = self.render_uncached(url, data).await?;
 
         match &self.template {
             Some(tmpl) => Ok(tmpl.assemble(&fragment, replacements)),
             None => Ok(fragment),
         }
+    }
+
+    /// Turn what the pool returned into what the caller gets: the pool's error
+    /// type mapped into the engine's, and the empty-render floor applied.
+    ///
+    /// Every path that reaches V8 ends this way. They each used to spell it
+    /// out, which is one copy per entry point and one chance per copy for a new
+    /// one to forget [`guard_empty`](Self::guard_empty) — and forgetting it
+    /// does not fail, it serves a blank page under a 200.
+    #[cfg(feature = "v8-pool")]
+    fn finish(&self, rendered: Result<String, PoolError>) -> SsrResult<String> {
+        self.guard_empty(rendered.map_err(Self::map_pool_error)?)
     }
 
     /// Refuse a render that produced (almost) nothing, when the caller has said
@@ -690,6 +753,25 @@ impl SsrEngine {
     #[cfg(feature = "cache")]
     pub fn cache(&self) -> &SsrCache {
         &self.cache
+    }
+
+    /// Whether the bundle's render function returned a value or a promise, as
+    /// last observed.
+    ///
+    /// [`RenderFnShape::Unknown`](crate::v8_pool::RenderFnShape) until a render
+    /// has completed — the shape is observed rather than declared, so there is
+    /// nothing to report before one has.
+    ///
+    /// This exists to be *reported*, not branched on: both shapes render
+    /// correctly and the engine treats them identically. What it is for is
+    /// telling a developer something their bundle never says out loud — that a
+    /// synchronous render function cannot render a suspending component, so
+    /// every code-split route is being served as whatever placeholder the
+    /// bundle falls back to. See [the render-function
+    /// contract](Self::render#the-render-function-contract).
+    #[cfg(feature = "v8-pool")]
+    pub fn render_fn_shape(&self) -> crate::v8_pool::RenderFnShape {
+        self.v8_pool.render_fn_shape()
     }
 
     /// The page cache — finished documents, keyed by [`RenderKey`].

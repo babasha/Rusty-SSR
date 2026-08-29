@@ -9,12 +9,13 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
+mod common;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rusty_ssr::cache::{BuiltPage, CachePolicy, RenderKey};
-use rusty_ssr::SsrEngine;
 
 const BUNDLE: &str = r#"
     globalThis.renderPage = function(url, data) {
@@ -22,19 +23,8 @@ const BUNDLE: &str = r#"
     };
 "#;
 
-fn engine(policy: CachePolicy) -> Arc<SsrEngine> {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("bundle.js");
-    std::fs::write(&bundle_path, BUNDLE).unwrap();
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(2)
-        .page_cache(policy)
-        .build_engine()
-        .unwrap();
-    // The bundle is read at build time, so the temp dir can go.
-    drop(dir);
-    Arc::new(engine)
+fn engine(policy: CachePolicy) -> common::Fixture {
+    common::engine_with(BUNDLE, |b| b.pool_size(2).page_cache(policy))
 }
 
 fn body(page: &rusty_ssr::cache::CachedPage) -> String {
@@ -50,7 +40,7 @@ async fn a_hit_skips_the_render_and_everything_around_it() {
     let builds = Arc::new(AtomicUsize::new(0));
 
     for _ in 0..3 {
-        let engine2 = Arc::clone(&engine);
+        let engine2 = engine.shared();
         let counter = Arc::clone(&builds);
         let page = engine
             .page(&key, move || async move {

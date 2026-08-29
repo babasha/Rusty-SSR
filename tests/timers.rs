@@ -4,7 +4,8 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::SsrEngine;
+mod common;
+
 use std::time::Duration;
 
 // Proves two things at once:
@@ -25,15 +26,7 @@ const TIMER_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn settimeout_callback_is_deferred_not_synchronous() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("timer.js");
-    std::fs::write(&bundle_path, TIMER_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(TIMER_BUNDLE);
 
     let html = tokio::time::timeout(Duration::from_secs(10), engine.render("/timer"))
         .await

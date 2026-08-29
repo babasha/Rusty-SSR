@@ -6,6 +6,8 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
+mod common;
+
 use rusty_ssr::SsrEngine;
 
 /// Writes to `localStorage` and reports what it found there on arrival.
@@ -27,15 +29,7 @@ const STORAGE_BUNDLE: &str = r#"
 /// renders share an isolate, which is exactly the case the boundary exists for.
 #[tokio::test]
 async fn a_render_cannot_read_what_the_previous_one_stored() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("storage.js");
-    std::fs::write(&bundle_path, STORAGE_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(STORAGE_BUNDLE);
 
     let first = engine.render_uncached("/visitor-a", "{}").await.unwrap();
     assert_eq!(first, "nothing", "a cold isolate starts empty");
@@ -60,15 +54,7 @@ const HOOK_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn the_bundle_gets_a_hook_to_clear_its_own_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("hook.js");
-    std::fs::write(&bundle_path, HOOK_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(HOOK_BUNDLE);
 
     for _ in 0..3 {
         let out = engine.render_uncached("/x", "{}").await.unwrap();
@@ -97,15 +83,7 @@ const OWN_STORAGE_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn a_bundle_that_owns_its_storage_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("own.js");
-    std::fs::write(&bundle_path, OWN_STORAGE_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(OWN_STORAGE_BUNDLE);
 
     // The bundle's own storage is its business: resetting it would be the
     // prelude overruling a deliberate choice, which the non-clobbering rule
@@ -125,15 +103,7 @@ const BROKEN_HOOK_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn a_throwing_reset_hook_fails_the_render() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("broken-hook.js");
-    std::fs::write(&bundle_path, BROKEN_HOOK_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(BROKEN_HOOK_BUNDLE);
 
     let err = engine
         .render_uncached("/x", "{}")
@@ -152,20 +122,10 @@ async fn a_throwing_reset_hook_fails_the_render() {
 /// render, not fail on a missing hook.
 #[tokio::test]
 async fn a_bundle_without_the_prelude_still_renders() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("bare.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine_with(
         r#"globalThis.renderPage = function(url) { return "bare:" + url; };"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .polyfills(false)
-        .build_engine()
-        .unwrap();
+        |b| b.polyfills(false),
+    );
 
     // Twice: the "there is no hook" answer has to be cached as an answer, or
     // every render would pay to re-discover it.
@@ -189,15 +149,7 @@ const LOCATION_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn location_comes_from_the_render_url() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("location.js");
-    std::fs::write(&bundle_path, LOCATION_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(LOCATION_BUNDLE);
 
     assert_eq!(
         engine.render_uncached("/venda/blumenau?quartos=2#mapa", "{}").await.unwrap(),
@@ -215,22 +167,12 @@ async fn location_comes_from_the_render_url() {
 /// An absolute URL brings its own origin with it.
 #[tokio::test]
 async fn an_absolute_url_sets_the_origin_too() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("origin.js");
-    std::fs::write(
-        &bundle_path,
+    let engine = common::engine(
         r#"globalThis.renderPage = () => {
                const l = globalThis.location;
                return [l.origin, l.protocol, l.host, l.hostname, l.port, l.pathname].join("|");
            };"#,
-    )
-    .unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    );
 
     assert_eq!(
         engine.render_uncached("https://morada.test:8443/venda", "{}").await.unwrap(),
@@ -276,15 +218,7 @@ async fn sealed_globals_do_not_survive_a_render() {
 /// on for everyone would break it silently.
 #[tokio::test]
 async fn without_sealing_a_global_survives_as_before() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("unsealed.js");
-    std::fs::write(&bundle_path, LEAKY_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .build_engine()
-        .unwrap();
+    let engine = common::engine(LEAKY_BUNDLE);
 
     assert_eq!(engine.render_uncached("/a", "{}").await.unwrap(), "nothing");
     assert_eq!(engine.render_uncached("/b", "{}").await.unwrap(), "/a");

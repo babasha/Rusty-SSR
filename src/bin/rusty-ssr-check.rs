@@ -157,6 +157,7 @@ impl Options {
 
 #[cfg(feature = "v8-pool")]
 async fn run(opts: Options) -> i32 {
+    use rusty_ssr::v8_pool::RenderFnShape;
     use rusty_ssr::SsrEngine;
 
     let mut failed = false;
@@ -197,6 +198,35 @@ async fn run(opts: Options) -> i32 {
             }
             Err(e) => check(false, "renders", format!(" {url} — {e}")),
         }
+    }
+
+    // Sync or async — reported, never failed on. Both render correctly, and a
+    // bundle that code-splits nothing has no reason to be async.
+    //
+    // It earns a line of output because the engine awaits whatever the render
+    // function returns, which makes the two indistinguishable from outside — so
+    // a bundle can be written against a synchronous contract that was never
+    // required, and nothing anywhere contradicts it. The cost of believing it
+    // lands on exactly the pages worth server-rendering: a sync renderer throws
+    // when a component suspends, so a lazily-loaded route cannot render and
+    // gets swapped for whatever placeholder the bundle falls back to. That
+    // placeholder is then what crawlers read. Nothing errors; somebody has to
+    // look at a page to find out.
+    match engine.render_fn_shape() {
+        RenderFnShape::Async => println!(
+            "ok   {}() is async — a suspending component can render",
+            opts.render_fn
+        ),
+        RenderFnShape::Sync => println!(
+            "note {}() is synchronous, returning HTML directly.\n\
+             \x20    Fine if nothing in this bundle suspends. If it code-splits, a lazy\n\
+             \x20    route cannot render here and its placeholder is what crawlers get —\n\
+             \x20    the engine awaits the render function, so it may return a Promise\n\
+             \x20    (renderToStringAsync and the equivalents in React/Vue/Solid).",
+            opts.render_fn
+        ),
+        // Nothing rendered, so every URL above already failed and said so.
+        RenderFnShape::Unknown => {}
     }
 
     // Does this bundle carry state between requests? The engine reuses its

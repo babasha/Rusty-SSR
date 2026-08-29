@@ -5,7 +5,8 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::SsrEngine;
+mod common;
+
 use std::time::{Duration, Instant};
 
 // Only "/hang" loops forever (never allocates, so the heap cap can't catch it);
@@ -20,16 +21,10 @@ const BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn hanging_render_times_out_and_worker_is_reclaimed() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("hang.js");
-    std::fs::write(&bundle_path, BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1) // single worker: recovery is only possible via the watchdog
-        .request_timeout(Some(Duration::from_millis(300)))
-        .build_engine()
-        .unwrap();
+    // One worker (the helper default): recovery is only possible via the watchdog.
+    let engine = common::engine_with(BUNDLE, |b| {
+        b.request_timeout(Some(Duration::from_millis(300)))
+    });
 
     // 1) The hang must surface as an error near request_timeout, not hang.
     let start = Instant::now();

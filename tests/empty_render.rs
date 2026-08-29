@@ -8,7 +8,9 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::{SsrEngine, SsrError};
+mod common;
+
+use rusty_ssr::SsrError;
 
 /// The shape production actually has: the bundle catches its own throw and
 /// returns the empty string, so from Rust the render "succeeded".
@@ -23,20 +25,16 @@ const SWALLOWING_BUNDLE: &str = r#"
     };
 "#;
 
-fn engine(path: &std::path::Path, min_bytes: Option<usize>) -> SsrEngine {
-    let mut builder = SsrEngine::builder().bundle_path(path).pool_size(1);
-    if let Some(min) = min_bytes {
-        builder = builder.min_render_bytes(min);
-    }
-    builder.build_engine().unwrap()
+fn engine(source: &str, min_bytes: Option<usize>) -> common::Fixture {
+    common::engine_with(source, |b| match min_bytes {
+        Some(min) => b.min_render_bytes(min),
+        None => b,
+    })
 }
 
 #[tokio::test]
 async fn a_blank_render_is_an_error_when_a_floor_is_set() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swallow.js");
-    std::fs::write(&path, SWALLOWING_BUNDLE).unwrap();
-    let engine = engine(&path, Some(20));
+    let engine = engine(SWALLOWING_BUNDLE, Some(20));
 
     let good = engine.render_uncached("/", "{}").await.unwrap();
     assert!(good.contains("a real page"));
@@ -51,10 +49,7 @@ async fn a_blank_render_is_an_error_when_a_floor_is_set() {
 /// real thing and the engine cannot tell the two apart on its own.
 #[tokio::test]
 async fn without_a_floor_the_blank_render_is_returned_as_is() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swallow-default.js");
-    std::fs::write(&path, SWALLOWING_BUNDLE).unwrap();
-    let engine = engine(&path, None);
+    let engine = engine(SWALLOWING_BUNDLE, None);
 
     assert_eq!(engine.render_uncached("/broken", "{}").await.unwrap(), "");
 }
@@ -63,14 +58,10 @@ async fn without_a_floor_the_blank_render_is_returned_as_is() {
 /// blank page just as surely as one that returned "".
 #[tokio::test]
 async fn whitespace_does_not_count_as_a_page() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("whitespace.js");
-    std::fs::write(
-        &path,
+    let engine = engine(
         r#"globalThis.renderPage = () => "\n   \t  \n";"#,
-    )
-    .unwrap();
-    let engine = engine(&path, Some(10));
+        Some(10),
+    );
 
     match engine.render_uncached("/", "{}").await {
         Err(SsrError::EmptyRender(bytes)) => assert_eq!(bytes, 0, "trimmed length"),
@@ -82,10 +73,7 @@ async fn whitespace_does_not_count_as_a_page() {
 /// number is what tells you whether the floor is set right.
 #[tokio::test]
 async fn a_thin_render_reports_what_it_produced() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("thin.js");
-    std::fs::write(&path, r#"globalThis.renderPage = () => "<div></div>";"#).unwrap();
-    let engine = engine(&path, Some(200));
+    let engine = engine(r#"globalThis.renderPage = () => "<div></div>";"#, Some(200));
 
     match engine.render_uncached("/", "{}").await {
         Err(SsrError::EmptyRender(bytes)) => assert_eq!(bytes, "<div></div>".len()),
@@ -97,10 +85,7 @@ async fn a_thin_render_reports_what_it_produced() {
 /// whichever way the data went in.
 #[tokio::test]
 async fn the_guard_covers_every_render_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("always-empty.js");
-    std::fs::write(&path, r#"globalThis.renderPage = () => "";"#).unwrap();
-    let engine = engine(&path, Some(10));
+    let engine = engine(r#"globalThis.renderPage = () => "";"#, Some(10));
 
     assert!(matches!(
         engine.render_uncached("/", "{}").await,
@@ -121,10 +106,7 @@ async fn the_guard_covers_every_render_path() {
 /// hold the blank page the guard exists to reject.
 #[tokio::test]
 async fn a_refused_render_is_not_cached() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("empty-cache.js");
-    std::fs::write(&path, r#"globalThis.renderPage = () => "";"#).unwrap();
-    let engine = engine(&path, Some(10));
+    let engine = engine(r#"globalThis.renderPage = () => "";"#, Some(10));
 
     assert!(engine.render("/x").await.is_err());
     assert!(engine.render("/x").await.is_err(), "a cached blank would come back Ok");

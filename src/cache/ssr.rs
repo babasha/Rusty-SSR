@@ -14,6 +14,50 @@ use super::hot::HotCache;
 use super::padded::CachePadded;
 use super::utils::hash_url;
 
+/// One lookup in this many is timed for [`CacheMetrics::last_access_ns`].
+///
+/// Reading the monotonic clock costs more than the lookup it would be timing —
+/// tens of nanoseconds against the single-digit nanoseconds a hot hit is
+/// supposed to take — so timing every lookup made the measurement the most
+/// expensive thing on the hit path, and on a miss the reading was taken and
+/// then thrown away. Sampling keeps the metric (it is a latency gauge, not a
+/// counter, so a sample is exactly as informative as the whole population)
+/// while taking the clock out of the other 255 lookups.
+const LATENCY_SAMPLE_EVERY: u64 = 256;
+
+/// The counters behind [`CacheMetrics`].
+///
+/// Generated so the list exists once. It used to be written out three times —
+/// the fields, the snapshot, and the reset — and a counter missing from the
+/// reset is invisible until somebody clears a cache and the numbers do not go
+/// to zero.
+macro_rules! cache_counters {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Default)]
+        struct CacheMetricsInner {
+            $($field: CachePadded<AtomicU64>,)+
+        }
+
+        impl CacheMetricsInner {
+            /// Back to zero, every counter, no exceptions.
+            fn reset(&self) {
+                $(self.$field.store(0, Ordering::Relaxed);)+
+            }
+        }
+    };
+}
+
+cache_counters!(
+    lookups,
+    hot_hits,
+    cold_hits,
+    misses,
+    promotions,
+    insertions,
+    evictions,
+    last_access_ns,
+);
+
 /// Multi-tier SSR cache
 ///
 /// ## Architecture
@@ -23,22 +67,13 @@ use super::utils::hash_url;
 /// Entries found in cold cache are automatically promoted to hot cache.
 pub struct SsrCache {
     hot_cache: ThreadLocal<RefCell<HotCacheState>>,
-    cold_cache: Arc<ColdCache>,
+    // Held directly rather than behind an `Arc`. Nothing ever cloned either
+    // handle, so the indirection bought nothing and cost a pointer chase on
+    // every single lookup — on the hit path, which is the path that matters.
+    cold_cache: ColdCache,
     ttl_secs: u64,
     generation: AtomicU64,
-    metrics: Arc<CacheMetricsInner>,
-}
-
-#[derive(Default)]
-struct CacheMetricsInner {
-    lookups: CachePadded<AtomicU64>,
-    hot_hits: CachePadded<AtomicU64>,
-    cold_hits: CachePadded<AtomicU64>,
-    misses: CachePadded<AtomicU64>,
-    promotions: CachePadded<AtomicU64>,
-    insertions: CachePadded<AtomicU64>,
-    evictions: CachePadded<AtomicU64>,
-    last_access_ns: CachePadded<AtomicU64>,
+    metrics: CacheMetricsInner,
 }
 
 /// Cache metrics snapshot
@@ -58,7 +93,11 @@ pub struct CacheMetrics {
     pub insertions: u64,
     /// LRU evictions
     pub evictions: u64,
-    /// Last access time in nanoseconds
+    /// How long the last *sampled* lookup took, in nanoseconds.
+    ///
+    /// A gauge, not a total: one lookup in 256 is timed, and this holds the
+    /// most recent of those readings. See the note on sampling in this
+    /// module — timing every lookup cost more than the lookups did.
     pub last_access_ns: u64,
     /// Current cold cache size
     pub cold_size: usize,
@@ -100,10 +139,10 @@ impl SsrCache {
 
         Self {
             hot_cache: ThreadLocal::new(),
-            cold_cache: Arc::new(ColdCache::with_ttl(max_cold_entries, ttl_secs)),
+            cold_cache: ColdCache::with_ttl(max_cold_entries, ttl_secs),
             ttl_secs,
             generation: AtomicU64::new(0),
-            metrics: Arc::new(CacheMetricsInner::default()),
+            metrics: CacheMetricsInner::default(),
         }
     }
 
@@ -113,16 +152,16 @@ impl SsrCache {
     /// Cold hits are promoted to hot cache.
     pub fn try_get(&self, key: &str) -> Option<Arc<str>> {
         let key_hash = hash_url(key);
-        let start = Instant::now();
-        self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
+        // `fetch_add` hands back the previous value, so the counter doubles as
+        // the sampling clock and no second atomic is needed to decide.
+        let n = self.metrics.lookups.fetch_add(1, Ordering::Relaxed);
+        let start = n.is_multiple_of(LATENCY_SAMPLE_EVERY).then(Instant::now);
 
         // 1. Check hot cache (L1/L2) - use peek() for read-only access
         let hot = self.get_or_init_hot_cache();
         if let Some(html) = hot.borrow().cache.peek(key_hash, key) {
             self.metrics.hot_hits.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .last_access_ns
-                .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.record_latency(start);
             return Some(html);
         }
 
@@ -135,14 +174,23 @@ impl SsrCache {
             hot_ref.cache.insert(key_hash, Arc::from(key), Arc::clone(&html));
             self.metrics.promotions.fetch_add(1, Ordering::Relaxed);
 
-            self.metrics
-                .last_access_ns
-                .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.record_latency(start);
             return Some(html);
         }
 
         self.metrics.misses.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    /// Record how long a sampled lookup took. A no-op for the lookups that
+    /// were not sampled, which is all but one in [`LATENCY_SAMPLE_EVERY`].
+    #[inline(always)]
+    fn record_latency(&self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.metrics
+                .last_access_ns
+                .store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Insert HTML into cache
@@ -197,7 +245,7 @@ impl SsrCache {
     pub fn clear(&self) {
         self.cold_cache.clear();
         self.generation.fetch_add(1, Ordering::Relaxed);
-        self.reset_metrics();
+        self.metrics.reset();
     }
 
     /// Get current cold cache size
@@ -231,19 +279,6 @@ impl SsrCache {
         }
     }
 
-    fn reset_metrics(&self) {
-        self.metrics.lookups.store(0, Ordering::Relaxed);
-        self.metrics.hot_hits.store(0, Ordering::Relaxed);
-        self.metrics.cold_hits.store(0, Ordering::Relaxed);
-        self.metrics.misses.store(0, Ordering::Relaxed);
-        self.metrics.promotions.store(0, Ordering::Relaxed);
-        self.metrics.insertions.store(0, Ordering::Relaxed);
-        self.metrics.evictions.store(0, Ordering::Relaxed);
-        self.metrics
-            .last_access_ns
-            .store(0, Ordering::Relaxed);
-    }
-
     fn get_or_init_hot_cache(&self) -> &RefCell<HotCacheState> {
         let generation = self.generation.load(Ordering::Relaxed);
         let hot = self.hot_cache.get_or(|| {
@@ -253,8 +288,14 @@ impl SsrCache {
             })
         });
 
-        {
+        // Fast path: a shared borrow is enough to see the generation is current,
+        // and it is current for every lookup that is not racing an
+        // invalidation — which is essentially all of them. Taking the exclusive
+        // borrow unconditionally meant every hit paid for a write to the
+        // `RefCell` flag, and then the caller immediately took a second borrow.
+        if hot.borrow().generation != generation {
             let mut state = hot.borrow_mut();
+            // Re-check: another borrow could have caught up in between.
             if state.generation != generation {
                 state.cache.clear();
                 state.generation = generation;

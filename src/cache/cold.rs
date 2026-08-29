@@ -8,7 +8,7 @@
 
 use dashmap::DashMap;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,14 +39,40 @@ struct CacheEntry {
     key: Arc<str>,
     html: Arc<str>,
     last_access: AtomicU64,
-    created_at: Instant,
+    /// When this entry was stored. `None` when the cache has no TTL, which is
+    /// also why it is not simply an `Instant`: reading the clock costs tens of
+    /// nanoseconds on every insert, and a cache with no TTL never looks at it.
+    created_at: Option<Instant>,
 }
 
 /// Shared cold cache in RAM
 pub struct ColdCache {
     cache: DashMap<u64, CacheEntry>,
     max_entries: usize,
-    access_counter: CachePadded<AtomicU64>,
+    /// Entry count, maintained rather than derived.
+    ///
+    /// `DashMap::len()` sums the lengths of all 128 shards, and `insert` used
+    /// to call it every single time just to ask "am I full yet?" — 128 shard
+    /// reads to answer a question one integer can answer. The count is updated
+    /// only where the map's population actually changes, so it stays exact;
+    /// `size_never_drifts` in `tests/cache_semantics.rs` is what holds it to
+    /// that.
+    ///
+    len: CachePadded<AtomicUsize>,
+    /// Coarse clock ordering entries for eviction.
+    ///
+    /// Advanced by inserts, and only *read* by lookups. That asymmetry is the
+    /// point: the previous design had every cache hit do a `fetch_add` on one
+    /// shared counter, so the line holding it ping-ponged between every core
+    /// reading the cache — on the read path, in a read-mostly structure, which
+    /// is precisely where 128 shards were supposed to have removed all sharing.
+    /// A load leaves the line in a shared state and costs nothing to contend.
+    ///
+    /// The cost is resolution: accesses between two inserts are indistinguishable
+    /// to eviction, so the policy is "least recently used, to the nearest
+    /// insert". Since eviction only ever runs *because* of an insert, that is
+    /// the granularity at which the answer is used anyway.
+    access_clock: CachePadded<AtomicU64>,
     evicting: CachePadded<AtomicBool>,
     ttl: Option<Duration>,
 }
@@ -55,13 +81,7 @@ impl ColdCache {
     /// Create a new cold cache with optimized shard count
     #[allow(dead_code)]
     pub fn new(max_entries: usize) -> Self {
-        Self {
-            cache: DashMap::with_capacity_and_shard_amount(max_entries, OPTIMAL_SHARD_COUNT),
-            max_entries,
-            access_counter: CachePadded::new(AtomicU64::new(0)),
-            evicting: CachePadded::new(AtomicBool::new(false)),
-            ttl: None,
-        }
+        Self::with_ttl(max_entries, 0)
     }
 
     /// Create a cold cache with TTL and optimized shard count
@@ -69,7 +89,8 @@ impl ColdCache {
         Self {
             cache: DashMap::with_capacity_and_shard_amount(max_entries, OPTIMAL_SHARD_COUNT),
             max_entries,
-            access_counter: CachePadded::new(AtomicU64::new(0)),
+            len: CachePadded::new(AtomicUsize::new(0)),
+            access_clock: CachePadded::new(AtomicU64::new(0)),
             evicting: CachePadded::new(AtomicBool::new(false)),
             ttl: if ttl_secs > 0 {
                 Some(Duration::from_secs(ttl_secs))
@@ -96,16 +117,17 @@ impl ColdCache {
 
         // Check TTL
         if let Some(ttl) = self.ttl {
-            if entry.created_at.elapsed() > ttl {
+            if entry.created_at.is_some_and(|at| at.elapsed() > ttl) {
                 drop(entry);
-                self.cache.remove(&key_hash);
+                self.remove_hash(key_hash);
                 return None;
             }
         }
 
-        // Update LRU counter
-        let new_access = self.access_counter.fetch_add(1, Ordering::Relaxed);
-        entry.last_access.store(new_access, Ordering::Relaxed);
+        // Mark as used. A load of the shared clock, not a read-modify-write of
+        // it — see `access_clock`.
+        let now = self.access_clock.load(Ordering::Relaxed);
+        entry.last_access.store(now, Ordering::Relaxed);
 
         Some(Arc::clone(&entry.html))
     }
@@ -114,24 +136,40 @@ impl ColdCache {
     ///
     /// Returns the number of evicted entries.
     pub fn insert(&self, key_hash: u64, key: Arc<str>, html: Arc<str>) -> usize {
-        let evicted = if self.cache.len() >= self.max_entries {
+        let evicted = if self.len.load(Ordering::Relaxed) >= self.max_entries {
             self.evict_batch()
         } else {
             0
         };
 
-        let new_access = self.access_counter.fetch_add(1, Ordering::Relaxed);
-        self.cache.insert(
+        let now = self.access_clock.fetch_add(1, Ordering::Relaxed);
+        let replaced = self.cache.insert(
             key_hash,
             CacheEntry {
                 key,
                 html,
-                last_access: AtomicU64::new(new_access),
-                created_at: Instant::now(),
+                last_access: AtomicU64::new(now),
+                created_at: self.ttl.map(|_| Instant::now()),
             },
         );
 
+        // Only a *new* key grows the cache; overwriting one does not.
+        if replaced.is_none() {
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+
         evicted
+    }
+
+    /// Remove one entry by hash, keeping the maintained count in step.
+    #[inline]
+    fn remove_hash(&self, key_hash: u64) -> bool {
+        if self.cache.remove(&key_hash).is_some() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Evict the oldest entries, draining the cache back down to the target.
@@ -154,7 +192,7 @@ impl ColdCache {
         }
 
         // Evict down to the target, capped per scan to bound work.
-        let len = self.cache.len();
+        let len = self.len.load(Ordering::Relaxed);
         let target = self.max_entries * EVICT_TARGET_PERCENT / 100;
         let cap_per_scan =
             (self.max_entries * EVICT_MAX_PER_SCAN_PERCENT / 100).max(EVICT_BATCH_MIN);
@@ -180,9 +218,11 @@ impl ColdCache {
             }
         }
 
-        let evicted = heap.len();
+        let mut evicted = 0;
         for (_, key) in heap {
-            self.cache.remove(&key);
+            if self.remove_hash(key) {
+                evicted += 1;
+            }
         }
 
         self.evicting.store(false, Ordering::Release);
@@ -191,21 +231,28 @@ impl ColdCache {
 
     /// Get number of entries
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.len.load(Ordering::Relaxed)
     }
 
     /// Check if empty
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
+        self.len() == 0
     }
 
     /// Remove a single entry by its key hash, verifying the full key matches
     /// (so a colliding entry under the same hash is left untouched).
     pub fn remove(&self, key_hash: u64, key: &str) -> bool {
-        self.cache
+        if self
+            .cache
             .remove_if(&key_hash, |_, e| e.key.as_ref() == key)
             .is_some()
+        {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove all entries whose key starts with the given prefix.
@@ -220,9 +267,11 @@ impl ColdCache {
             }
         }
 
-        let count = to_remove.len();
+        let mut count = 0;
         for hash in to_remove {
-            self.cache.remove(&hash);
+            if self.remove_hash(hash) {
+                count += 1;
+            }
         }
         count
     }
@@ -230,6 +279,7 @@ impl ColdCache {
     /// Clear the cache
     pub fn clear(&self) {
         self.cache.clear();
+        self.len.store(0, Ordering::Relaxed);
     }
 
     /// Get maximum capacity
@@ -237,7 +287,6 @@ impl ColdCache {
         self.max_entries
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

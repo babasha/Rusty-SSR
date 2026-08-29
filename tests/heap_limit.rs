@@ -7,7 +7,8 @@
 
 #![cfg(all(feature = "v8-pool", feature = "cache"))]
 
-use rusty_ssr::SsrEngine;
+mod common;
+
 use std::time::Duration;
 
 const RUNAWAY_BUNDLE: &str = r#"
@@ -21,17 +22,7 @@ const RUNAWAY_BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn heap_cap_terminates_runaway_render_without_aborting() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle_path = dir.path().join("runaway.js");
-    std::fs::write(&bundle_path, RUNAWAY_BUNDLE).unwrap();
-
-    let engine = SsrEngine::builder()
-        .bundle_path(&bundle_path)
-        .pool_size(1)
-        .cache_size(8)
-        .max_heap_mb(64)
-        .build_engine()
-        .expect("engine should build with a heap cap");
+    let engine = common::engine_with(RUNAWAY_BUNDLE, |b| b.cache_size(8).max_heap_mb(64));
 
     // Wrap in a timeout so a misbehaving cap fails the test instead of hanging
     // the suite forever.
