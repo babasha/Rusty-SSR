@@ -322,7 +322,7 @@ impl SsrConfigBuilder {
     ///
     /// Independent of `cache_size`/`cache_ttl`, which govern the older fragment
     /// cache. An application serving HTTP usually wants this one and can leave
-    /// the fragment cache at [`CachePolicy::Off`]-equivalent by simply never
+    /// the fragment cache at [`CachePolicy::Off`](crate::cache::CachePolicy::Off)-equivalent by simply never
     /// calling `render`/`render_with_data`.
     ///
     /// # Example

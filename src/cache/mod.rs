@@ -13,12 +13,12 @@
 //! - **Cold Cache**: Shared RAM cache with DashMap for lock-free access
 //! - **Auto-promotion**: Cold hits are promoted to hot cache
 //!
-//! All three describe the **fragment** cache ([`SsrCache`]): keyed on the
-//! render, storing what the render returned. Above it sits [`PageCache`] — the
+//! All three describe the **fragment** cache ([`SsrCache`](crate::cache::SsrCache)): keyed on the
+//! render, storing what the render returned. Above it sits [`PageCache`](crate::cache::PageCache) — the
 //! **finished-document** cache, keyed on whatever the caller says decides the
-//! page ([`RenderKey`]), storing status and bytes, with single-flight and
+//! page ([`RenderKey`](crate::cache::RenderKey)), storing status and bytes, with single-flight and
 //! stale-while-revalidate. An application serving HTTP almost always wants the
-//! second one; see [`page`] for the three reasons why.
+//! second one; see [`page`](crate::cache::page) for the three reasons why.
 
 mod cold;
 pub mod hot;  // Public for benchmarking
