@@ -398,3 +398,42 @@ fn invalidation_leaves_other_entries_readable_everywhere() {
         h.join().unwrap();
     }
 }
+
+/// Capacity has to hold under *concurrent* inserts, which is the only way a
+/// real engine ever fills a cache: one worker per core, all missing, all
+/// inserting. Every other test in this file drives the cache from one thread,
+/// and eviction has a guard that lets exactly one thread in at a time — so a
+/// single-threaded test exercises the one case where that guard never denies
+/// anybody, and says nothing about the case that actually happens.
+#[test]
+fn size_stays_within_capacity_under_concurrent_inserts() {
+    const CAP: usize = 300;
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 60_000;
+
+    let cache = Arc::new(SsrCache::new(CAP));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    // Every key unique: the crawler / cache-busting-query case,
+                    // where nothing is ever read back and everything is stored.
+                    cache.insert(&format!("/t{t}/{i}"), html("<p>x</p>"));
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let size = cache.size();
+    assert!(
+        size <= CAP * 2,
+        "a {CAP}-entry cache holds {size} entries after {} concurrent inserts — \
+         eviction is not keeping up, and the cache grows without bound",
+        THREADS * PER_THREAD
+    );
+}

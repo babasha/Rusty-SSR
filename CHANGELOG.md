@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.3.2
+
+### The fragment cache could grow without limit, and now cannot
+
+A `cache_size(300)` cache was found holding **twenty million entries** — every
+byte of every page it had ever rendered — under a stream of unique URLs. Any
+traffic that does not repeat itself reaches it: a crawler, cache-busting query
+strings, `?utm_*` links, or anyone who notices. The process grows until it is
+killed.
+
+Eviction scans the whole map to find the oldest entries, and a per-scan cap
+limited what one scan could then remove to 25% of capacity — 75 entries for the
+default 300. The cap was documented as bounding the work of a scan. It does not:
+the scan is O(n) whether 75 entries are removed afterwards or 75,000, so the cap
+bounded only the result. As soon as the inserts arriving during one pass
+outnumbered the cap, each pass ended further behind than it began; the map grew,
+the next pass took longer, and the gap widened on its own. There is no rate at
+which it recovers.
+
+It survived 0.3.0 only because the same `insert` also called `DashMap::len()`,
+summing 128 shards on every single insert. That was slow enough to hold the
+insert rate below the cliff — so removing it, as an unrelated optimisation two
+sections below, is what made a live bug visible. It was reachable before.
+
+Two changes:
+
+- **A scan now removes the entire overshoot**, not a fixed slice of it. The
+  cache settles at `target + (inserts arriving during one pass)` — a fixed
+  point, rather than a quantity that only grows.
+- **Far above capacity, nothing is ranked.** Ranking picks which few entries to
+  lose; when the cache holds millions against a cap of hundreds there is nothing
+  to pick, and paying to rank it is what turned "behind" into "hopelessly
+  behind" — a max-heap of eleven million entries took **sixteen seconds** to
+  build, during which thirteen million more arrived. Above one capacity's worth
+  of overshoot the pass instead drops by age against the insert clock, in a
+  single sweep with no extra memory. The heap remains for the ordinary
+  near-capacity case, where it is small and exact.
+
+Under sixteen threads rendering nothing but unique URLs for thirty seconds, a
+300-entry cache now holds 291 entries and evicts once per insert. Throughput
+went from 542,000 to 957,000 renders per second on the same machine, and the
+worst request went from sixteen seconds to seven milliseconds.
+
+`size_stays_within_capacity_under_concurrent_inserts` in
+`tests/cache_semantics.rs` is the regression test, and it is worth saying why
+the sixteen tests beside it did not catch this: they drive the cache from one
+thread. Eviction has a guard admitting one thread at a time, so a
+single-threaded test exercises the one case where that guard never turns anybody
+away. The bug lives entirely in the case where it does.
+
+`examples/loadtest.rs` is what found it, which none of the unit tests could
+have — the failure needs sustained concurrent pressure and only shows up in an
+aggregate nobody asserts on. It grew two scenarios (`--hit-ratio 0` for the V8
+path, `--hit-ratio 100` for the cache) and lost two flaws of its own: it pushed
+every latency through one shared mutex, which serialises the drivers and hid
+exactly this, and it deep-copied a 500,000-entry URL vector into each of 32
+tasks — sixteen million strings allocated before the first request, never read.
+
 ## 0.3.1
 
 ### The render function may be async, and now it says so

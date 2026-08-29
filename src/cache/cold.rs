@@ -19,16 +19,13 @@ use super::padded::CachePadded;
 const OPTIMAL_SHARD_COUNT: usize = 128;
 
 /// Each eviction scan drains the cache back down to this percent of capacity.
-/// Evicting *to a target* (rather than a fixed slice) is what keeps eviction
-/// from falling behind: every scan clears the whole overshoot, so the cache
-/// can't run away under a sustained insert storm — at most it drifts by
-/// `insert_rate × scan_time` above the cap between scans. The 10% headroom
-/// also means a scan only fires once per ~10%-of-capacity inserts.
+///
+/// Evicting *to a target* rather than by a fixed slice is what keeps eviction
+/// from falling behind: a scan clears the whole overshoot, so between scans the
+/// cache only drifts by `insert_rate × scan_time` above the target. The 10%
+/// headroom also means a scan fires about once per 10%-of-capacity inserts
+/// rather than on every one.
 const EVICT_TARGET_PERCENT: usize = 90;
-/// Cap the work of a single scan (bounds the transient heap + scan latency).
-/// Steady-state eviction (~10% of capacity) stays well under this; the cap only
-/// matters for a one-off catch-up after a large burst.
-const EVICT_MAX_PER_SCAN_PERCENT: usize = 25;
 /// Minimum entries to evict per scan (for tiny caches).
 const EVICT_BATCH_MIN: usize = 8;
 
@@ -57,7 +54,6 @@ pub struct ColdCache {
     /// only where the map's population actually changes, so it stays exact;
     /// `size_never_drifts` in `tests/cache_semantics.rs` is what holds it to
     /// that.
-    ///
     len: CachePadded<AtomicUsize>,
     /// Coarse clock ordering entries for eviction.
     ///
@@ -174,13 +170,12 @@ impl ColdCache {
 
     /// Evict the oldest entries, draining the cache back down to the target.
     ///
-    /// Only one thread evicts at a time — others skip and proceed with insert
-    /// (avoids 16 concurrent O(n) scans). Crucially, each scan evicts *down to
-    /// the target* (not a fixed slice), so the cache returns to ~90% of cap
-    /// every scan and can't run away: between scans it only grows by
-    /// `insert_rate × scan_time`, which is far below the 10% headroom for any
-    /// realistic insert rate. Uses a bounded max-heap to find the oldest
-    /// without allocating for the whole cache.
+    /// Only one thread evicts at a time — others skip and proceed with their
+    /// insert, so a burst costs one O(n) scan rather than sixteen. Each scan
+    /// clears the entire overshoot, which is what gives the loop a fixed point;
+    /// see the note inside on the per-scan cap that used to prevent exactly
+    /// that. A max-heap bounded by the overshoot finds the oldest entries
+    /// without allocating for the whole map.
     fn evict_batch(&self) -> usize {
         // Guard: only one thread evicts at a time to avoid thundering herd
         if self
@@ -191,39 +186,85 @@ impl ColdCache {
             return 0;
         }
 
-        // Evict down to the target, capped per scan to bound work.
         let len = self.len.load(Ordering::Relaxed);
         let target = self.max_entries * EVICT_TARGET_PERCENT / 100;
-        let cap_per_scan =
-            (self.max_entries * EVICT_MAX_PER_SCAN_PERCENT / 100).max(EVICT_BATCH_MIN);
-        let batch = len
-            .saturating_sub(target)
-            .clamp(EVICT_BATCH_MIN, cap_per_scan);
+        let overshoot = len.saturating_sub(target);
 
-        // Max-heap keyed by access time: the top element is the *newest* among candidates.
-        // We keep only `batch` entries — if a new entry is older than the top, swap it in.
-        let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(batch + 1);
+        // There used to be a per-scan cap here — 25% of capacity, so 75 entries
+        // for the default 300 — described as bounding the work of one scan. It
+        // did the opposite of what it was for. Finding the oldest entries costs
+        // a full O(n) pass whether 75 of them are then removed or 75,000, so the
+        // cap bounded not the scan but only its *result*. Once the inserts
+        // arriving during one pass outnumbered the cap, every pass ended further
+        // behind than it began: the map grew, the next pass took longer, and the
+        // cache ran away without limit. Sixteen threads put 850,000 entries into
+        // a 300-entry cache, which is a memory-exhaustion bug reachable by any
+        // traffic with unique URLs — a crawler, or cache-busting query strings.
+        let evicted = if overshoot > self.max_entries {
+            // Far above capacity: rank nothing, drop by age in a single pass.
+            //
+            // Ranking is for choosing which few entries to lose. When the cache
+            // holds millions against a cap of hundreds, nearly everything has to
+            // go and there is nothing to choose — and paying to rank it is what
+            // turns "behind" into "hopelessly behind". A heap of eleven million
+            // entries took sixteen seconds to build, during which thirteen
+            // million more arrived: the pass meant to catch up was itself the
+            // reason it never could.
+            //
+            // The clock advances once per insert, so keeping everything within
+            // `target` ticks of now keeps approximately the newest `target`
+            // entries — the same answer the heap would have laboured to, in one
+            // pass and no extra memory.
+            let cutoff = self
+                .access_clock
+                .load(Ordering::Relaxed)
+                .saturating_sub(target as u64);
 
-        for entry in self.cache.iter() {
-            let access = entry.last_access.load(Ordering::Relaxed);
-            let key = *entry.key();
+            let mut removed = 0usize;
+            self.cache.retain(|_, entry| {
+                let keep = entry.last_access.load(Ordering::Relaxed) >= cutoff;
+                if !keep {
+                    removed += 1;
+                }
+                keep
+            });
+            // Subtract what this pass removed rather than storing a total:
+            // other threads are still inserting, and their increments must not
+            // be lost.
+            self.len.fetch_sub(removed, Ordering::Relaxed);
+            removed
+        } else {
+            // Near capacity, the ordinary case: pick the oldest `batch`
+            // precisely, with a heap the branch above keeps from ever exceeding
+            // one cache's worth.
+            let batch = overshoot.max(EVICT_BATCH_MIN);
 
-            if heap.len() < batch {
-                heap.push((access, key));
-            } else if let Some(&(top_access, _)) = heap.peek() {
-                if access < top_access {
-                    heap.pop();
+            // Max-heap keyed by access time: the top element is the *newest* among candidates.
+            // We keep only `batch` entries — if a new entry is older than the top, swap it in.
+            let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(batch + 1);
+
+            for entry in self.cache.iter() {
+                let access = entry.last_access.load(Ordering::Relaxed);
+                let key = *entry.key();
+
+                if heap.len() < batch {
                     heap.push((access, key));
+                } else if let Some(&(top_access, _)) = heap.peek() {
+                    if access < top_access {
+                        heap.pop();
+                        heap.push((access, key));
+                    }
                 }
             }
-        }
 
-        let mut evicted = 0;
-        for (_, key) in heap {
-            if self.remove_hash(key) {
-                evicted += 1;
+            let mut evicted = 0;
+            for (_, key) in heap {
+                if self.remove_hash(key) {
+                    evicted += 1;
+                }
             }
-        }
+            evicted
+        };
 
         self.evicting.store(false, Ordering::Release);
         evicted
