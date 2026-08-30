@@ -159,3 +159,48 @@ async fn atob_refuses_junk() {
     let out = engine.render_uncached("/", "{}").await.unwrap();
     assert!(out.starts_with("refused:"), "got: {out}");
 }
+
+/// The four things a decode table and a chunked output buffer can get wrong
+/// that a one-character-at-a-time decoder could not.
+///
+/// `atob` was rewritten in 0.3.4 for speed — it was 22% of a real consumer's
+/// SSR render — and every case below is a boundary the old implementation did
+/// not have. Padding and whitespace it did handle, and they are here because
+/// they are the contract the rewrite had to preserve, not because they were at
+/// risk. The other two were:
+///
+///   * a code point past the 256-entry table. An out-of-range read on a typed
+///     array is `undefined`, and `undefined < 0` is false, so the obvious
+///     spelling accepts `Ā` as a base64 digit and invents bytes.
+///   * a payload longer than one output run, which has to stitch. Everything
+///     the crate's own tests decode is a few bytes long and never reaches it.
+#[tokio::test]
+async fn atob_handles_padding_whitespace_high_code_points_and_long_payloads() {
+    let engine = common::engine(
+        r#"globalThis.renderPage = () => {
+               const out = [];
+               // Every padding shape, one two and no '=' characters.
+               out.push(atob("TWE=") + "/" + atob("TWFu") + "/" + atob("TQ=="));
+               // Whitespace is stripped wherever it appears, not just at the ends.
+               out.push(atob(" Zm9v\nYmFy ") === "foobar" ? "ws-ok" : "ws-BAD");
+               // A length that no base64 can have.
+               try { atob("A"); out.push("len-accepted"); }
+               catch (e) { out.push("len-" + (e.message.indexOf("length") >= 0 ? "refused" : "wrong")); }
+               // Past the table. Four characters, so it survives the length
+               // check and reaches the lookup, which is the point.
+               try { atob("QUJĀ"); out.push("hi-accepted"); }
+               catch (e) { out.push("hi-refused"); }
+               // Longer than one output run, so the result is stitched from
+               // several. Every byte value appears, including NUL.
+               let big = "";
+               for (let i = 0; i < 20000; i++) big += String.fromCharCode(i % 256);
+               out.push(atob(btoa(big)) === big ? "big-ok(" + big.length + ")" : "big-BAD");
+               return out.join("|");
+           };"#,
+    );
+
+    assert_eq!(
+        engine.render_uncached("/", "{}").await.unwrap(),
+        "Ma/Man/M|ws-ok|len-refused|hi-refused|big-ok(20000)"
+    );
+}

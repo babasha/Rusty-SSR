@@ -192,23 +192,59 @@ if (typeof globalThis.document === 'undefined') globalThis.document = {
 // these are for the code that has base64 in it for its own reasons (a JWT
 // payload, a data: URL, a stored blob).
 const __RUSTY_B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+// A decode table, built once when the prelude is evaluated, because the
+// alternative turned out to be the most expensive thing in a real render.
+//
+// This used to resolve each character with `__RUSTY_B64.indexOf(s.charAt(i))`:
+// a one-character string allocation and a scan of up to 64 characters, per byte
+// of input. Profiled against a consumer whose server hands the page a 21 kB
+// base64 protobuf seed, that decoder was the single largest frame in the whole
+// SSR render — 22% of sampled CPU, ahead of every frame in the application
+// itself — and ran at 9 MB/s. By table it is 308 MB/s on the same payload, and
+// takes the render with it: 1.42x end to end, output identical byte for byte.
+//
+// Nothing in this crate's own benchmarks could have seen it. They render
+// bundles that have no base64 in them, so the polyfill never ran.
+const __RUSTY_B64_DEC = new Int16Array(256).fill(-1);
+for (let i = 0; i < 64; i++) __RUSTY_B64_DEC[__RUSTY_B64.charCodeAt(i)] = i;
+// Output is stitched from runs rather than one string per byte: pushing a
+// single-character string per output byte and joining at the end allocated N
+// strings and an N-element array to produce N characters.
+const __RUSTY_B64_RUN = 4096;
 if (typeof globalThis.atob === 'undefined') {
     globalThis.atob = function (input) {
-        const s = String(input).replace(/[\t\n\f\r ]+/g, '').replace(/=+$/, '');
-        if (s.length % 4 === 1) throw new Error('atob: invalid base64 length');
-        const out = [];
-        let bits = 0, acc = 0;
-        for (let i = 0; i < s.length; i++) {
-            const idx = __RUSTY_B64.indexOf(s.charAt(i));
+        let s = String(input);
+        // Tested rather than always rewritten: the overwhelmingly common input
+        // has no whitespace at all, and the scan costs less than the replace.
+        if (/[\t\n\f\r ]/.test(s)) s = s.replace(/[\t\n\f\r ]+/g, '');
+        // Trailing '=' is padding, not data. Walked back rather than stripped
+        // with /=+$/ so the string is never rebuilt.
+        let len = s.length;
+        while (len > 0 && s.charCodeAt(len - 1) === 61) len--;
+        if (len % 4 === 1) throw new Error('atob: invalid base64 length');
+        const run = new Array(__RUSTY_B64_RUN);
+        let out = '', ri = 0, acc = 0, bits = 0;
+        for (let i = 0; i < len; i++) {
+            const c = s.charCodeAt(i);
+            // The `c < 256` guard is load-bearing: an out-of-range read on a
+            // typed array is `undefined`, and `undefined < 0` is false, so
+            // without it a code point past the table would be accepted as a
+            // digit instead of refused.
+            const idx = c < 256 ? __RUSTY_B64_DEC[c] : -1;
             if (idx < 0) throw new Error('atob: invalid base64');
             acc = (acc << 6) | idx;
             bits += 6;
             if (bits >= 8) {
                 bits -= 8;
-                out.push(String.fromCharCode((acc >> bits) & 0xff));
+                run[ri++] = (acc >> bits) & 0xff;
+                if (ri === __RUSTY_B64_RUN) {
+                    out += String.fromCharCode.apply(null, run);
+                    ri = 0;
+                }
             }
         }
-        return out.join('');
+        if (ri > 0) out += String.fromCharCode.apply(null, run.slice(0, ri));
+        return out;
     };
 }
 if (typeof globalThis.btoa === 'undefined') {

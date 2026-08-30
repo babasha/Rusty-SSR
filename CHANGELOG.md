@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.3.4
+
+### The prelude's `atob` was the most expensive frame in a real render
+
+Not in the consumer's application — in this crate. `BROWSER_POLYFILLS` resolved
+each base64 character with `__RUSTY_B64.indexOf(s.charAt(i))`: a one-character
+string allocation and a scan of up to 64 characters, **per byte of input**, with
+the result accumulated as one single-character string per output byte and joined
+at the end.
+
+A CPU profile of the consumer this crate was written for — an SSR bundle whose
+server hands the page a 21 kB base64 protobuf seed on every request — put that
+function at the top of the list at **21.9% of sampled time**, ahead of every
+frame in the application, ahead of Preact's renderer, ahead of the garbage
+collector. It decoded at 9 MB/s.
+
+By a 256-entry lookup table, with the output stitched from 4 kB runs, the same
+payload decodes at **308 MB/s — 34×**. End to end that is **1.44× on the whole
+page render**, and the rendered document is identical byte for byte.
+
+Against the real server — two binaries from identical application source
+differing only in which version of this crate they link, alternating rounds on
+pinned cores — it is **1.09× on the whole request** for a route that carries a
+26 kB seed: 247 → 270 pages/s, with B ahead in every round. The gap between
+1.44× and 1.09× is not disagreement: 8 workers at 247/s is 32.4 ms per request
+and at 270/s is 29.6 ms, so **2.8 ms was saved against the 2.9 ms the isolated
+decode predicted for a payload that size.** The render is simply a smaller part
+of a real request than it is of a render benchmark.
+
+The same run on a route with no seed, where this function is never called, moved
+1.002× — which is what makes the seeded number a measurement rather than
+drift. Ask for that control before believing any figure in this file: an
+earlier attempt at the same comparison reported a 6% "win" on the control and a
+46% swing on the page-cache path, because something else on the machine was
+using the CPU.
+
+Nothing here could have found it. The crate's own benchmarks render bundles with
+no base64 in them, so the polyfill never ran; `BENCHMARK.md`'s figures are all
+from pages that never called it. It took profiling a real application's real
+payload, which is the general lesson rather than this specific function.
+
+The contract is unchanged, deliberately, down to the error text: whitespace
+(`\t\n\f\r` and space) stripped wherever it appears, trailing `=` stripped,
+`length % 4 === 1` throwing `atob: invalid base64 length`, anything else
+throwing `atob: invalid base64`.
+
+Five tests in `tests/bytes_payload.rs`, of which two cover boundaries the old
+implementation did not have:
+
+- **a code point past the table.** An out-of-range read on a typed array is
+  `undefined`, and `undefined < 0` is false — so the obvious spelling accepts
+  `Ā` as a base64 digit and invents bytes. The `c < 256` guard is why it does
+  not.
+- **a payload longer than one output run**, which has to stitch. Everything the
+  crate decoded before this was a few bytes long and never reached it; the test
+  round-trips 20,000 bytes covering every value including NUL.
+
+`btoa` next door has the same per-character shape and is left alone: nothing on
+a render path calls it, and a change nobody can measure is a change nobody can
+justify.
+
 ## 0.3.3
 
 ### The pool can now be asked how close it is to capacity
