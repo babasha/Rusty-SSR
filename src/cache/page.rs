@@ -288,12 +288,15 @@ pub struct BuiltPage {
     pub body: String,
     /// Extra response headers. Usually empty.
     pub headers: Vec<(String, String)>,
+    /// May this page be kept? `true` for everything a constructor makes; see
+    /// [`uncacheable`](Self::uncacheable) for the case that says otherwise.
+    pub cacheable: bool,
 }
 
 impl BuiltPage {
     /// A document with a status and no extra headers.
     pub fn new(status: u16, body: impl Into<String>) -> Self {
-        Self { status, body: body.into(), headers: Vec::new() }
+        Self { status, body: body.into(), headers: Vec::new(), cacheable: true }
     }
 
     /// A 200 with this body.
@@ -307,7 +310,44 @@ impl BuiltPage {
             status,
             body: String::new(),
             headers: vec![("location".to_string(), location.into())],
+            cacheable: true,
         }
+    }
+
+    /// Serve this page, but do not keep it.
+    ///
+    /// For the answer a build can produce but should not be held to: a render
+    /// whose data source did not answer, a page assembled from a degraded
+    /// upstream, anything correct enough to send and not correct enough to
+    /// repeat. The caller gets the page; the next request for the same key
+    /// builds again.
+    ///
+    /// It exists because the alternative is worse in both directions. Return
+    /// `Err` instead and the page is not cached — but it is also not SERVED,
+    /// so the caller has to have a second, degraded answer ready and every
+    /// visitor in that window gets it. Return `Ok` and the bad answer is
+    /// pinned for the length of the TTL, which turns a momentary fault into a
+    /// URL that stays wrong long after the fault is over. That is not a
+    /// hypothetical: the consumer this crate was written for spent an evening
+    /// serving a catalogue page whose listings query had timed out ONCE — a
+    /// header, a result count, and an empty grid, cached and handed to every
+    /// reload for the next five minutes, while the database behind it was
+    /// healthy the whole time.
+    ///
+    /// ```rust
+    /// # use rusty_ssr::cache::BuiltPage;
+    /// # fn rows_from_the_database() -> Option<Vec<String>> { None }
+    /// let page = match rows_from_the_database() {
+    ///     Some(rows) => BuiltPage::ok(format!("{} rows", rows.len())),
+    ///     // Render it — the client can fill the gap — but do not let the
+    ///     // next visitor inherit this one's bad luck.
+    ///     None => BuiltPage::ok("<em>loading…</em>").uncacheable(),
+    /// };
+    /// assert!(!page.cacheable);
+    /// ```
+    pub fn uncacheable(mut self) -> Self {
+        self.cacheable = false;
+        self
     }
 
     /// Add a response header.
@@ -415,27 +455,36 @@ impl PageCache {
     /// Store a finished page and hand back the buffer to answer this request
     /// with, so the caller does not clone the document it just built.
     ///
-    /// Under [`CachePolicy::Off`] this stores nothing and just converts.
+    /// Under [`CachePolicy::Off`], and for a page the build marked
+    /// [`uncacheable`](BuiltPage::uncacheable), this stores nothing and just
+    /// converts.
     pub fn store(&self, key: &RenderKey, page: BuiltPage) -> CachedPage {
         self.store_at(key.cache_key(), page)
     }
 
     /// [`store`](Self::store), for a caller that already has the composed key.
+    ///
+    /// Every path that keeps a page goes through here — `store`, the
+    /// single-flight leader, and the background revalidation — so `cacheable`
+    /// is honoured in one place rather than three. A flag checked at two of
+    /// three call sites is the same bug as no flag at all, and harder to see.
     fn store_at(&self, cache_key: String, page: BuiltPage) -> CachedPage {
-        let BuiltPage { status, body, headers } = page;
+        let BuiltPage { status, body, headers, cacheable } = page;
         let body = Bytes::from(body);
-        if let Ok(mut guard) = self.entries.lock() {
-            if let Some(entries) = guard.as_mut() {
-                entries.put(
-                    cache_key,
-                    Entry {
-                        status,
-                        body: body.clone(),
-                        headers: headers.clone(),
-                        stored_at: Instant::now(),
-                        refreshing: false,
-                    },
-                );
+        if cacheable {
+            if let Ok(mut guard) = self.entries.lock() {
+                if let Some(entries) = guard.as_mut() {
+                    entries.put(
+                        cache_key,
+                        Entry {
+                            status,
+                            body: body.clone(),
+                            headers: headers.clone(),
+                            stored_at: Instant::now(),
+                            refreshing: false,
+                        },
+                    );
+                }
             }
         }
         CachedPage { status, body, headers, age: Duration::ZERO, stale: false }
@@ -587,6 +636,16 @@ impl PageCache {
         Fut: Future<Output = SsrResult<BuiltPage>> + Send,
     {
         match build().await {
+            // An uncacheable rebuild replaces nothing, so the stale entry is
+            // still there and still claimed. Release it, exactly as an error
+            // does: the rebuild declined to be kept, which is a reason to try
+            // again later, not a reason to stop trying. Without this the key
+            // stays marked until it is evicted and no stale hit ever
+            // revalidates it again.
+            Ok(page) if !page.cacheable => {
+                self.release_refresh(&cache_key);
+                tracing::debug!(url = %url, "revalidation declined to be cached");
+            }
             Ok(page) => {
                 self.store_at(cache_key, page);
                 tracing::debug!(url = %url, "revalidated stale page");
@@ -1005,6 +1064,175 @@ mod tests {
             assert!(task.await.unwrap(), "every caller has to hear about it");
         }
         assert!(c.is_empty(), "and nothing was cached");
+    }
+
+    /// A failed build must leave the key CLEAN, not merely unstored.
+    ///
+    /// The distinction is the whole reason a caller may deliberately return
+    /// `Err` to mean "render this, but do not keep it": a caller does exactly
+    /// that when the query behind a catalog page did not answer, because the
+    /// page it would otherwise build — a catalog with an empty grid — is one
+    /// this cache would then serve to everybody for the next five minutes.
+    /// That is only safe if the NEXT request rebuilds and caches normally; a
+    /// single-flight slot or a refresh claim left behind would turn one bad
+    /// second into a permanently uncacheable URL.
+    #[tokio::test]
+    async fn a_failed_build_leaves_the_key_ready_to_try_again() {
+        let c = cache(CachePolicy::default());
+        let k = key("/imoveis/blumenau");
+
+        let failed = c
+            .get_or_build(&k, || async { Err(SsrError::Cache("query unavailable".into())) })
+            .await;
+        assert!(failed.is_err());
+        assert!(c.is_empty(), "a refusal must not be stored");
+
+        let page = c
+            .get_or_build(&k, || async { Ok(BuiltPage::ok("24 listings")) })
+            .await
+            .expect("the next attempt must be allowed to build");
+        assert_eq!(body(&page), "24 listings");
+        assert_eq!(
+            body(&c.get(&k).expect("and it is cached now")),
+            "24 listings",
+        );
+    }
+
+    // ── uncacheable pages ───────────────────────────────────────────────────
+
+    /// The whole promise of `BuiltPage::uncacheable`: the caller is answered,
+    /// and nothing is kept. `Err` gives the second half without the first.
+    #[tokio::test]
+    async fn an_uncacheable_build_is_served_and_not_stored() {
+        let c = cache(CachePolicy::default());
+        let k = key("/imoveis/blumenau");
+
+        let page = c
+            .get_or_build(&k, || async { Ok(BuiltPage::ok("empty grid").uncacheable()) })
+            .await
+            .expect("an uncacheable page is still an answer");
+
+        assert_eq!(body(&page), "empty grid", "the caller gets the page");
+        assert!(c.is_empty(), "and the cache did not keep it");
+    }
+
+    /// …and the next request must build again rather than inherit it. This is
+    /// the difference between "this one answer was bad" and "this URL is
+    /// broken until something evicts it".
+    #[tokio::test]
+    async fn the_request_after_an_uncacheable_one_rebuilds() {
+        let c = cache(CachePolicy::default());
+        let k = key("/imoveis/blumenau");
+
+        let _ = c
+            .get_or_build(&k, || async { Ok(BuiltPage::ok("empty grid").uncacheable()) })
+            .await
+            .unwrap();
+        let page = c
+            .get_or_build(&k, || async { Ok(BuiltPage::ok("24 listings")) })
+            .await
+            .unwrap();
+
+        assert_eq!(body(&page), "24 listings");
+        assert_eq!(body(&c.get(&k).expect("the good one IS kept")), "24 listings");
+    }
+
+    /// Single flight still collapses the burst — every waiter is answered with
+    /// the page, and none of them is answered from a cache that never got one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_on_an_uncacheable_build_still_answers_everyone() {
+        let c = cache(CachePolicy::default());
+        let k = key("/imoveis/blumenau");
+        let builds = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let c = Arc::clone(&c);
+            let k = k.clone();
+            let builds = Arc::clone(&builds);
+            tasks.push(tokio::spawn(async move {
+                c.get_or_build(&k, move || async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(BuiltPage::ok("empty grid").uncacheable())
+                })
+                .await
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(body(&task.await.unwrap().unwrap()), "empty grid");
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "one build for eight requests");
+        assert!(c.is_empty(), "and still nothing kept");
+    }
+
+    /// `store` is a public entry of its own, and it must obey the flag too —
+    /// a caller that composes its own key would otherwise route around it.
+    #[test]
+    fn store_refuses_an_uncacheable_page() {
+        let c = cache(CachePolicy::default());
+        let k = key("/x");
+        let page = c.store(&k, BuiltPage::ok("do not keep").uncacheable());
+        assert_eq!(body(&page), "do not keep", "still handed back");
+        assert!(c.get(&k).is_none(), "and not stored");
+    }
+
+    /// The path that is easiest to forget: a stale page revalidating in the
+    /// background, where the rebuild declines to be kept. The stale copy must
+    /// survive (it is a previous GOOD answer), and the refresh claim must be
+    /// released, or this key never revalidates again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_uncacheable_revalidation_keeps_the_stale_page_and_frees_the_claim() {
+        let c = cache(CachePolicy::ttl(8, TTL).stale_while_revalidate(Duration::from_secs(60)));
+        let k = key("/imoveis/blumenau");
+        c.store(&k, BuiltPage::ok("24 listings"));
+        if !c.age(&k, TTL + Duration::from_secs(1)) {
+            return; // the test helper could not age it; same guard as the sibling tests
+        }
+
+        // A stale hit: answered from the stale copy, rebuild runs behind it.
+        let served = c
+            .get_or_build(&k, || async { Ok(BuiltPage::ok("empty grid").uncacheable()) })
+            .await
+            .unwrap();
+        assert_eq!(body(&served), "24 listings", "the visitor gets the stale page");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(
+            body(&c.get(&k).expect("the stale page is still there")),
+            "24 listings",
+            "an uncacheable rebuild must not evict what it declined to replace",
+        );
+
+        // …and the claim was released, so the NEXT stale hit rebuilds. If it
+        // were still marked, this build would never run.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        let _ = c
+            .get_or_build(&k, move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(BuiltPage::ok("24 listings again"))
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the key is revalidating again");
+    }
+
+    /// Every constructor makes a cacheable page. The flag is opt-OUT, so a
+    /// caller that never heard of it behaves exactly as it did before.
+    #[test]
+    fn pages_are_cacheable_unless_they_say_otherwise() {
+        assert!(BuiltPage::ok("x").cacheable);
+        assert!(BuiltPage::new(404, "x").cacheable);
+        assert!(BuiltPage::redirect(301, "/y").cacheable);
+        assert!(BuiltPage::from((200, "x".to_string())).cacheable);
+        assert!(BuiltPage::ok("x").header("a", "b").cacheable);
+        assert!(!BuiltPage::ok("x").uncacheable().cacheable);
+        // …and the builder composes with the others in either order.
+        assert!(!BuiltPage::ok("x").uncacheable().header("a", "b").cacheable);
+        assert!(!BuiltPage::ok("x").header("a", "b").uncacheable().cacheable);
     }
 
     /// The stale hit is answered immediately — the visitor does not wait for

@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.4.0
+
+### A build can now say "serve this, but do not keep it"
+
+`BuiltPage::uncacheable()`, and a `cacheable: bool` on `BuiltPage` that every
+constructor sets to `true`. `PageCache` honours it in `store_at`, which is the
+one place all three storing paths go through — `store`, the single-flight
+leader, and the background revalidation.
+
+**Why it had to exist.** Before this a build had exactly two answers, and
+neither one fits a page that is correct enough to send and not correct enough to
+repeat:
+
+* `Ok(page)` — served AND pinned for the length of the TTL.
+* `Err(_)` — not pinned, but not served either, so the caller needs a second
+  degraded answer ready and every visitor in that window gets it instead.
+
+The consumer this crate was written for spent an evening on the gap between
+them. Its catalogue page is rendered from a database query; the query timed out
+**once**, under a burst of unrelated load on a one-core box; the render
+succeeded anyway and produced a page with a header, a result count and an empty
+grid. `get_or_build` stored it, because a build that returns `Ok` is by
+definition a page worth keeping — and for the next five minutes every request
+for that URL was answered from it. Reloading did not help. The database was
+healthy the entire time. The only signal anything was wrong was the response
+size: 48 kB where a good render is 422 kB.
+
+The workaround was to return `Err` and let the handler fall through to a
+client-only shell. That works, and it throws away the server render for a case
+where the server render is perfectly good — the page is missing one section, and
+the client fills that section in on its own.
+
+```rust
+use rusty_ssr::cache::BuiltPage;
+
+let page = match rows_from_the_database() {
+    Some(rows) => BuiltPage::ok(render(&rows)),
+    // Render it — the client can fill the gap — but do not let the next
+    // visitor inherit this one's bad luck.
+    None       => BuiltPage::ok(render(&[])).uncacheable(),
+};
+```
+
+**The stale path is the one worth reading twice.** A stale hit is answered from
+the old copy while a rebuild runs behind it, and that rebuild holds a `refreshing`
+claim so a burst of stale hits starts exactly one of them. An uncacheable
+rebuild replaces nothing, so it must release that claim — otherwise the key
+stays marked until eviction and never revalidates again, which is a worse
+failure than the one this feature exists to prevent. It also must NOT evict the
+stale entry: that copy is a previous good answer, and declining to replace it is
+not a reason to throw it away.
+
+Six tests cover it, including the burst case (one build, eight waiters, nothing
+kept) and the revalidation case above. Each was checked by breaking the code it
+covers: removing the `cacheable` branch in `store_at` fails four of them, and
+removing the claim release fails exactly the one that describes it.
+
+### Breaking
+
+`BuiltPage` has a fourth public field, so a struct literal
+`BuiltPage { status, body, headers }` no longer compiles. Every constructor —
+`new`, `ok`, `redirect`, `From<(u16, String)>` — is unchanged and fills it in,
+so callers that build pages the normal way need no edit. This is why the bump is
+0.4.0 rather than 0.3.5.
+
 ## 0.3.4
 
 ### The prelude's `atob` was the most expensive frame in a real render
