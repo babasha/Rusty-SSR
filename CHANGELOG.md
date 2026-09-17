@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.5.0
+
+### A cached page can carry one derived encoding of itself
+
+`CachedPage::encoded_or_init(f)`, plus `CachedPage::encoded()` to look without
+computing, and `CachedPage::new()` because the struct gained a private field and
+a literal outside this crate therefore stopped compiling. That private field is
+an `Arc<OnceLock<Bytes>>` shared with the entry, so `f` runs **once per cached
+page**, not once per hit, and a burst coalesces on it the way a burst on a cold
+key already coalesces on the render.
+
+**Why the cell belongs in the entry.** A caller can compress a body perfectly
+well on its own; what it cannot do cheaply is decide when the compressed copy
+has expired. The page it holds is a `Bytes` clone with no identity, so a twin
+kept in the caller's own cache has to be keyed by something, and both choices
+are bad:
+
+* **by URL** — goes stale the instant the page is rebuilt, and serves the
+  previous document with a correct status and a correct length, which nothing
+  downstream can detect;
+* **by a hash of the body** — costs a pass over the whole document on every
+  request, spending a good part of what compressing once was supposed to save.
+
+Inside the entry the question disappears: the derived form lives exactly as long
+as the bytes it came from, and a rebuild replaces both together. A page that the
+build marked `uncacheable` gets a cell of its own, so its encoding is made for
+that response and dies with it.
+
+**What it was written for.** The consumer of this crate serves a 450 kB
+catalogue page and lets nginx compress it. Measured on its production box:
+brotli cost **20.8 ms of CPU per request** at quality 5, on bytes this cache had
+already rendered and was handing out unchanged — the single most expensive thing
+in the whole stack, and paid again for every visitor of the same page. An
+upstream response that already carries `Content-Encoding` is passed through by
+nginx untouched, so moving the compression here turns per-request work into
+per-entry work.
+
+The crate compresses nothing itself and takes no compression dependency: `f` is
+the caller's, and returning an empty `Bytes` is how it declines — cached like
+any other answer, so a body that will not compress is not re-attempted forever.
+
 ## 0.4.0
 
 ### A build can now say "serve this, but do not keep it"

@@ -34,7 +34,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -270,6 +270,85 @@ pub struct CachedPage {
     /// True when this came from the stale-while-revalidate window, i.e. it is
     /// past its TTL and a rebuild is running behind it.
     pub stale: bool,
+    /// One derived representation of `body`, shared with the cached entry so it
+    /// is computed once and reused by every later hit. See
+    /// [`encoded_or_init`](CachedPage::encoded_or_init); private because it is
+    /// a cell whose emptiness means "not computed yet", which is not a fact a
+    /// caller should be able to set.
+    encoded: Arc<OnceLock<Bytes>>,
+}
+
+impl CachedPage {
+    /// A page that belongs to no cache — for a caller assembling a response by
+    /// hand, and for tests.
+    ///
+    /// Exists because this struct gained a private field in 0.5 and a struct
+    /// literal therefore stopped compiling outside this crate.
+    pub fn new(status: u16, body: Bytes, headers: Vec<(String, String)>) -> Self {
+        Self {
+            status,
+            body,
+            headers,
+            age: Duration::ZERO,
+            stale: false,
+            encoded: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// A second encoding of `body` — a compressed twin, typically — computed
+    /// **once per cached entry** and handed to every hit after that.
+    ///
+    /// ## Why this is in the cache and not in the caller
+    ///
+    /// A caller can obviously compress a body itself. What it cannot easily do
+    /// is know *when* to stop: the page it holds is a `Bytes` clone with no
+    /// identity, so a twin kept in a cache of the caller's own has to be keyed
+    /// by something — the URL, which goes stale the moment the page is rebuilt,
+    /// or a hash of the body, which costs a pass over the whole document on
+    /// every request and thereby spends a good part of what compressing once
+    /// was meant to save. Keeping the cell *inside* the entry removes the
+    /// question: the twin lives exactly as long as the bytes it was made from,
+    /// and a rebuilt page starts with an empty one.
+    ///
+    /// ## What it costs
+    ///
+    /// Nothing on a hit but an `Arc` deref. On a miss, `f` runs once — and
+    /// only once even if a hundred requests arrive together, because
+    /// [`OnceLock::get_or_init`] makes the losers wait for the winner rather
+    /// than each compressing a copy of the same document.
+    ///
+    /// `f` is handed the body and must return the encoded form. It has no way
+    /// to say "no", by design: returning an **empty** `Bytes` is that answer,
+    /// and it is cached like any other, so a body that refuses to compress is
+    /// not re-attempted on every request.
+    ///
+    /// A page from [`new`](Self::new) has its own cell, so the work is done and
+    /// thrown away with the response — which is what an uncacheable page should
+    /// do.
+    ///
+    /// ```no_run
+    /// # use rusty_ssr::cache::CachedPage;
+    /// # use bytes::Bytes;
+    /// # fn compress(_: &[u8]) -> Vec<u8> { Vec::new() }
+    /// # fn example(page: &CachedPage, client_accepts_br: bool) -> Bytes {
+    /// if client_accepts_br {
+    ///     let twin = page.encoded_or_init(|body| Bytes::from(compress(body)));
+    ///     if !twin.is_empty() {
+    ///         return twin.clone();
+    ///     }
+    /// }
+    /// page.body.clone()
+    /// # }
+    /// ```
+    pub fn encoded_or_init(&self, f: impl FnOnce(&Bytes) -> Bytes) -> &Bytes {
+        self.encoded.get_or_init(|| f(&self.body))
+    }
+
+    /// The derived encoding if one has already been computed, without computing
+    /// it. For a caller that wants to report on the cache rather than use it.
+    pub fn encoded(&self) -> Option<&Bytes> {
+        self.encoded.get()
+    }
 }
 
 /// What a build step produces: a whole response.
@@ -371,6 +450,11 @@ struct Entry {
     /// Set while a background revalidation is in flight, so a burst of stale
     /// hits starts exactly one rebuild.
     refreshing: bool,
+    /// The cell behind [`CachedPage::encoded_or_init`]. Held here, and cloned
+    /// into every `CachedPage` this entry answers, so the derived form is made
+    /// once and cannot outlive the bytes it was derived from: a rebuild
+    /// replaces the whole `Entry`, cell and all.
+    encoded: Arc<OnceLock<Bytes>>,
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
@@ -449,6 +533,10 @@ impl PageCache {
             headers: entry.headers.clone(),
             age,
             stale,
+            // The Arc, not its contents: every hit on this entry shares one
+            // cell, which is what makes the derived form cost one computation
+            // rather than one per request.
+            encoded: Arc::clone(&entry.encoded),
         })
     }
 
@@ -471,6 +559,12 @@ impl PageCache {
     fn store_at(&self, cache_key: String, page: BuiltPage) -> CachedPage {
         let BuiltPage { status, body, headers, cacheable } = page;
         let body = Bytes::from(body);
+        // Made here so the entry and the page answering THIS request share one
+        // cell: the request that fills the cache is usually also the one that
+        // pays for the derived form, and there is no reason for it to pay
+        // twice. An uncacheable page keeps its cell to itself and it dies with
+        // the response, which is the point of it being uncacheable.
+        let encoded = Arc::new(OnceLock::new());
         if cacheable {
             if let Ok(mut guard) = self.entries.lock() {
                 if let Some(entries) = guard.as_mut() {
@@ -482,12 +576,13 @@ impl PageCache {
                             headers: headers.clone(),
                             stored_at: Instant::now(),
                             refreshing: false,
+                            encoded: Arc::clone(&encoded),
                         },
                     );
                 }
             }
         }
-        CachedPage { status, body, headers, age: Duration::ZERO, stale: false }
+        CachedPage { status, body, headers, age: Duration::ZERO, stale: false, encoded }
     }
 
     /// Drop the page stored under `key`. Returns whether there was one.
@@ -1527,6 +1622,120 @@ mod tests {
         let one = key("/x").variant("lang", "pt").variant("lang", "en");
         let two = key("/x").variant("lang", "pt");
         assert_ne!(one.cache_key(), two.cache_key());
+    }
+
+    // ── the derived encoding ────────────────────────────────────────────────
+
+    /// The whole point: it is computed once per ENTRY, not once per hit. A
+    /// counter rather than a timing, because "it was fast the second time"
+    /// would also pass if the work were merely cached somewhere wrong.
+    #[test]
+    fn the_derived_form_is_computed_once_and_shared_by_every_hit() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        c.store(&k, BuiltPage::new(200, "hello".to_string()));
+        let runs = AtomicUsize::new(0);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let page = c.get(&k).expect("still cached");
+            let enc = page.encoded_or_init(|b| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Bytes::from(b.to_vec())
+            });
+            seen.push(String::from_utf8(enc.to_vec()).unwrap());
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "recomputed on a hit");
+        assert!(seen.iter().all(|s| s == "hello"), "{seen:?}");
+    }
+
+    /// The reason the cell lives in the entry rather than in a cache of the
+    /// caller's own. A rebuilt page must NOT be answerable with the previous
+    /// page's encoding — that is a wrong document served with a correct status,
+    /// which nothing downstream can detect.
+    #[test]
+    fn a_rebuild_throws_the_old_encoding_away() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        c.store(&k, BuiltPage::new(200, "first".to_string()));
+        let first = c.get(&k).unwrap();
+        assert_eq!(first.encoded_or_init(|b| Bytes::from(b.to_vec())), "first");
+
+        c.store(&k, BuiltPage::new(200, "second".to_string()));
+        let second = c.get(&k).unwrap();
+        let enc = second.encoded_or_init(|b| Bytes::from(b.to_vec()));
+        assert_eq!(enc, "second", "the rebuild answered with the old encoding");
+        // And the page the FIRST request is still holding keeps its own, which
+        // is correct: it is still serving those bytes.
+        assert_eq!(first.encoded().map(|b| b.to_vec()), Some(b"first".to_vec()));
+    }
+
+    /// An encoder that declines says so with an empty result, and that answer
+    /// is cached like any other — otherwise a body that cannot be compressed
+    /// would be re-attempted on every single request, which is the opposite of
+    /// what this is for.
+    #[test]
+    fn declining_to_encode_is_remembered() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        c.store(&k, BuiltPage::new(200, "hello".to_string()));
+        let runs = AtomicUsize::new(0);
+        for _ in 0..3 {
+            let page = c.get(&k).unwrap();
+            let enc = page.encoded_or_init(|_| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Bytes::new()
+            });
+            assert!(enc.is_empty());
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "a refusal was re-attempted");
+    }
+
+    /// A page the build declined to cache has a cell of its own, so the work is
+    /// done for this response and dies with it. If it shared anything, an
+    /// uncacheable page would be leaving state behind — the exact thing
+    /// `uncacheable` exists to prevent.
+    #[test]
+    fn an_uncacheable_page_encodes_for_itself_only() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        let page = c.store(&k, BuiltPage::new(200, "hi".to_string()).uncacheable());
+        assert_eq!(page.encoded_or_init(|b| Bytes::from(b.to_vec())), "hi");
+        assert!(c.get(&k).is_none(), "an uncacheable page was kept");
+    }
+
+    /// Nothing is computed until someone asks. A caller that never needs the
+    /// derived form must not pay for it.
+    #[test]
+    fn nothing_is_encoded_until_it_is_asked_for() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        c.store(&k, BuiltPage::new(200, "hello".to_string()));
+        assert!(c.get(&k).unwrap().encoded().is_none());
+    }
+
+    /// A burst on a cold entry must encode once, not once per thread — the
+    /// same argument single-flight makes about rendering, one layer down. Ten
+    /// threads, one slow encoder.
+    #[test]
+    fn a_burst_encodes_once() {
+        let c = cache(CachePolicy::ttl(8, TTL));
+        let k = key("/x");
+        c.store(&k, BuiltPage::new(200, "hello".to_string()));
+        let runs = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                let (c, k, runs) = (Arc::clone(&c), k.clone(), Arc::clone(&runs));
+                s.spawn(move || {
+                    let page = c.get(&k).unwrap();
+                    page.encoded_or_init(|b| {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        Bytes::from(b.to_vec())
+                    });
+                });
+            }
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the burst encoded more than once");
     }
 
     /// The digest has to distinguish payloads that differ only in order, or a

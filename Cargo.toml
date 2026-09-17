@@ -4,7 +4,7 @@
 
 [package]
 name = "rusty-ssr"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Egor Babushkin"]
 description = "High-performance SSR engine for Rust with V8 isolate pool and multi-tier caching"
