@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.6.0
+
+### A render can say which code-split modules it used, and the page preloads them
+
+A bundle built for SSR inlines its dynamic imports, so a lazy screen renders on
+the server with no request behind it — and the document says nothing about the
+chunk the browser will need to hydrate that screen. The browser finds out after
+the entry has downloaded and run. On a production listing page (phone, 4× CPU,
+slow 4G) the Detail chunk and its strings were requested ~0.5 s after the entry
+finished, and the chunk they import one step later again.
+
+* **The prelude collects module ids.** `globalThis.__rustySsrModule(id)` records
+  one; the list is reset at every request boundary, so one render's modules can
+  never reach another's document. A build plugin that wraps each `import()`
+  is the intended caller; ids are whatever the client build's manifest uses as
+  keys (for Vite, the path relative to the project root).
+* **`SsrEngine::render_uncached_collect(url, data) -> Rendered { html, modules }`**
+  — `render_uncached` plus the list, taken after the render's promise settles.
+  The empty-render floor applies unchanged. `V8Pool::render_collect` underneath.
+  Every existing method is unchanged and simply drops the list.
+* **`assets::ViteManifest`** reads `.vite/manifest.json` and turns the list into
+  `<link rel="modulepreload">` tags (plus `<link rel="stylesheet">` for CSS the
+  chunks carry): each module's chunk and its static imports, deduplicated,
+  leaving out every chunk an entry already imports statically — Vite writes
+  those tags into the HTML itself. Unknown ids are skipped: server-only code has
+  no chunk to preload.
+
+A bundle that reports nothing gets an empty list, and `.polyfills(false)` has no
+collector at all; both render exactly as before.
+
 ## 0.5.0
 
 ### A cached page can carry one derived encoding of itself

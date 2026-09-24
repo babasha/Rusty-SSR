@@ -120,6 +120,50 @@ impl RenderPayload {
     }
 }
 
+/// What one render produced: the HTML, and the code-split modules it used.
+///
+/// `modules` is what the bundle reported through `__rustySsrModule(id)` while
+/// it rendered — see the prelude — in the order it first asked for each. Empty
+/// for a bundle that reports nothing, which is every bundle that has not opted
+/// in, so ignoring it is always safe. Turn it into preload tags with
+/// [`ViteManifest::preload_links`](crate::assets::ViteManifest::preload_links).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rendered {
+    /// The string the render function returned.
+    pub html: String,
+    /// Manifest keys of the modules the render loaded, deduplicated.
+    pub modules: Vec<String>,
+}
+
+/// Collect the modules this render reported, emptying the list.
+///
+/// Never fails the render: the list is a hint for preloading, and a page
+/// without preload tags is the page every bundle got before this existed. A
+/// failure is logged and answered with an empty list.
+fn take_modules(state: &mut RuntimeState) -> Vec<String> {
+    if state.take_modules_fn.is_none() {
+        state.take_modules_fn = Some(resolve_global_fn(state, "__rustySsrTakeModules").unwrap_or(None));
+    }
+    let Some(Some(take)) = state.take_modules_fn.as_ref() else {
+        return Vec::new();
+    };
+    let scope = &mut state.runtime.handle_scope();
+    let func = v8::Local::new(scope, take);
+    let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
+    let tc = &mut v8::TryCatch::new(scope);
+    let Some(list) = func.call(tc, recv, &[]) else {
+        tracing::warn!("__rustySsrTakeModules threw: {}", caught_message(tc, "threw"));
+        return Vec::new();
+    };
+    match serde_v8::from_v8::<Vec<String>>(tc, list) {
+        Ok(modules) => modules,
+        Err(e) => {
+            tracing::warn!("__rustySsrTakeModules returned something else than strings: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Call `globalThis.__rustySsrReset(url)`, the per-request boundary.
 ///
 /// The URL goes with it because the boundary is also where `location` is set
@@ -259,7 +303,7 @@ pub fn render_html(
     render_function: &str,
     state: &mut RuntimeState,
     shape: &AtomicU8,
-) -> Result<String, String> {
+) -> Result<Rendered, String> {
     // Draw the request boundary before anything else runs. See the prelude's
     // `__rustySsrReset` for why a pooled isolate needs one.
     reset_request_state(url, state)?;
@@ -332,10 +376,17 @@ pub fn render_html(
         .map_err(|e| format!("JS render error: {}", e))?;
 
     // Deserialize the result string.
-    let scope = &mut state.runtime.handle_scope();
-    let local = v8::Local::new(scope, resolved);
-    serde_v8::from_v8::<String>(scope, local)
-        .map_err(|e| format!("Result deserialization error: {}", e))
+    let html = {
+        let scope = &mut state.runtime.handle_scope();
+        let local = v8::Local::new(scope, resolved);
+        serde_v8::from_v8::<String>(scope, local)
+            .map_err(|e| format!("Result deserialization error: {}", e))?
+    };
+
+    // After the promise, not before: an async render asks for its lazy
+    // modules while it awaits.
+    let modules = take_modules(state);
+    Ok(Rendered { html, modules })
 }
 
 #[cfg(test)]

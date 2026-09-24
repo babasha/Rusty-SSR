@@ -531,6 +531,44 @@ impl SsrEngine {
         )
     }
 
+    /// [`render_uncached`](Self::render_uncached), plus the code-split modules
+    /// the render used, so the document can preload them.
+    ///
+    /// A bundle built for SSR usually inlines its dynamic imports, so a lazy
+    /// screen renders on the server with no request behind it, and the browser
+    /// only learns it needs that screen's chunk after the entry has downloaded
+    /// and run. The bundle reports each module it loads by calling
+    /// `globalThis.__rustySsrModule(id)` — in practice a build plugin that
+    /// wraps every `import()` — and this returns the list beside the HTML.
+    /// [`ViteManifest::preload_links`](crate::assets::ViteManifest::preload_links)
+    /// turns it into tags.
+    ///
+    /// `modules` is empty for a bundle that reports nothing; the HTML is
+    /// exactly what `render_uncached` returns, empty-render guard included.
+    ///
+    /// ```rust,no_run
+    /// # use rusty_ssr::{SsrEngine, assets::ViteManifest};
+    /// # async fn example(engine: SsrEngine, manifest: ViteManifest) {
+    /// let page = engine.render_uncached_collect("/imovel/abc", "{}").await.unwrap();
+    /// let head_tags = manifest.preload_links(&page.modules);
+    /// # }
+    /// ```
+    #[cfg(feature = "v8-pool")]
+    pub async fn render_uncached_collect(
+        &self,
+        url: &str,
+        data: &str,
+    ) -> SsrResult<crate::v8_pool::Rendered> {
+        let rendered = self
+            .v8_pool
+            .render_collect(url.to_string(), crate::v8_pool::RenderPayload::Json(data.to_string()))
+            .await
+            .map_err(Self::map_pool_error)?;
+        let modules = rendered.modules;
+        let html = self.guard_empty(rendered.html)?;
+        Ok(crate::v8_pool::Rendered { html, modules })
+    }
+
     /// Render without caching, handing the bundle raw bytes.
     ///
     /// The payload arrives as a `Uint8Array` over the very buffer passed in —

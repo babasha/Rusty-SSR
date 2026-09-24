@@ -527,6 +527,28 @@ globalThis.__rustySsrSealGlobals = function () {
     __rustySealedGlobals = new Set(Object.getOwnPropertyNames(globalThis));
 };
 
+// The code-split modules a render used, for the document to preload.
+//
+// A bundle built for SSR inlines its dynamic imports, so a lazy screen renders
+// here with no request behind it — and nothing downstream learns that the
+// browser will need that screen's chunk the moment it hydrates. The browser
+// finds out itself only after the entry has downloaded and run, one round trip
+// too late: a listing page asked for its Detail chunk ~0.5 s after it could
+// have. The bundle reports each module as it asks for it (a build plugin wraps
+// every `import()`); the engine takes the list when the render finishes and a
+// `ViteManifest` turns it into `<link rel="modulepreload">` tags.
+//
+// Ids are whatever the bundle's build uses as manifest keys — for Vite, the
+// module path relative to the project root. Reset at every request boundary,
+// so one render's list can never reach another's document.
+let __rustyModules = new Set();
+globalThis.__rustySsrModule = function (id) { __rustyModules.add(String(id)); };
+globalThis.__rustySsrTakeModules = function () {
+    const out = Array.from(__rustyModules);
+    __rustyModules = new Set();
+    return out;
+};
+
 globalThis.__rustySsrReset = function (url) {
     // Anything the last render hung on globalThis goes. This is the half of
     // request isolation that needs no cooperation from the bundle: `onSsrRequest`
@@ -537,6 +559,8 @@ globalThis.__rustySsrReset = function (url) {
     // is right for correctness and wrong for a bundle that deliberately caches
     // across renders — a compiled-template cache, a warmed lookup table. Those
     // are legitimate, so opting in is the caller's decision, not ours.
+    __rustyModules = new Set();
+
     if (__rustySealedGlobals !== null) {
         const names = Object.getOwnPropertyNames(globalThis);
         for (let i = 0; i < names.length; i++) {

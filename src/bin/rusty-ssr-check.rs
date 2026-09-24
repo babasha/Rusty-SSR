@@ -55,6 +55,9 @@ Options:
   --min-bytes <n>     Fail a render shorter than this. Default: 1
   --no-polyfills      Load the bundle without the browser prelude
   --seal-globals      Delete globals added by a render, before the next one
+  --manifest <dir>    The client build's .vite directory: print the preload tags
+                      each render's modules turn into, and flag module ids the
+                      manifest has no entry for
   --dump-prelude      Write the prelude to stdout and exit
   --help              This text
 
@@ -70,6 +73,7 @@ struct Options {
     min_bytes: usize,
     polyfills: bool,
     seal_globals: bool,
+    manifest: Option<String>,
 }
 
 #[cfg(feature = "v8-pool")]
@@ -91,6 +95,7 @@ impl Options {
         let mut min_bytes = 1usize;
         let mut polyfills = true;
         let mut seal_globals = false;
+        let mut manifest = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -117,6 +122,10 @@ impl Options {
                     min_bytes = value("--min-bytes")?
                         .parse()
                         .map_err(|_| "--min-bytes needs a number".to_string())?;
+                    i += 2;
+                }
+                "--manifest" => {
+                    manifest = Some(value("--manifest")?);
                     i += 2;
                 }
                 "--no-polyfills" => {
@@ -151,6 +160,7 @@ impl Options {
             min_bytes,
             polyfills,
             seal_globals,
+            manifest,
         }))
     }
 }
@@ -189,12 +199,38 @@ async fn run(opts: Options) -> i32 {
         }
     };
 
+    let manifest = match opts.manifest.as_deref().map(rusty_ssr::assets::ViteManifest::from_dir) {
+        None => None,
+        Some(Ok(m)) => Some(m),
+        Some(Err(e)) => {
+            println!("FAIL manifest loads: {e}");
+            return 1;
+        }
+    };
+
     let mut rendered: Vec<(String, String)> = Vec::new();
     for url in &opts.urls {
-        match engine.render_uncached(url, &opts.data).await {
-            Ok(html) => {
-                check(true, "renders", format!(" {url} — {} bytes", html.len()));
-                rendered.push((url.clone(), html));
+        match engine.render_uncached_collect(url, &opts.data).await {
+            Ok(page) => {
+                check(true, "renders", format!(" {url} — {} bytes", page.html.len()));
+                // What the page would preload. A module id the manifest does not
+                // know is how a mismatch between the SSR build's ids and the
+                // client build's keys shows up — silently, as a missing tag.
+                if !page.modules.is_empty() {
+                    println!("     modules: {}", page.modules.join(", "));
+                }
+                if let Some(m) = &manifest {
+                    let p = m.preloads(&page.modules);
+                    for f in p.styles.iter().chain(&p.scripts) {
+                        println!("     preload: {f}");
+                    }
+                    for id in &page.modules {
+                        if !m.contains(id) {
+                            println!("note {id} is not in the manifest — nothing is preloaded for it");
+                        }
+                    }
+                }
+                rendered.push((url.clone(), page.html));
             }
             Err(e) => check(false, "renders", format!(" {url} — {e}")),
         }

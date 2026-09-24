@@ -307,7 +307,7 @@ impl Default for V8PoolConfig {
 struct RenderRequest {
     url: String,
     data: RenderPayload,
-    response_tx: oneshot::Sender<Result<String, String>>,
+    response_tx: oneshot::Sender<Result<super::renderer::Rendered, String>>,
     /// This task's slot in the bounded queue, released the moment a worker
     /// takes the task. The render function used to travel here too — a `String`
     /// cloned per request to carry a name that is the same for the life of the
@@ -512,6 +512,16 @@ impl V8Pool {
         url: String,
         data: RenderPayload,
     ) -> Result<String, PoolError> {
+        self.render_collect(url, data).await.map(|r| r.html)
+    }
+
+    /// Render, and also return the code-split modules the render used — see
+    /// [`Rendered`](super::renderer::Rendered).
+    pub async fn render_collect(
+        &self,
+        url: String,
+        data: RenderPayload,
+    ) -> Result<super::renderer::Rendered, PoolError> {
         let (response_tx, response_rx) = oneshot::channel();
         let deadline = self.config.request_timeout.map(|t| Instant::now() + t);
 
@@ -566,7 +576,7 @@ impl V8Pool {
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(Instant::now());
                 match tokio::time::timeout(remaining, response_rx).await {
-                    Ok(Ok(Ok(html))) => Ok(html),
+                    Ok(Ok(Ok(rendered))) => Ok(rendered),
                     Ok(Ok(Err(msg))) => Err(PoolError::Render(msg)),
                     Ok(Err(_)) => Err(PoolError::WorkerCrashed),
                     Err(_elapsed) => {
@@ -576,7 +586,7 @@ impl V8Pool {
                 }
             }
             None => match response_rx.await {
-                Ok(Ok(html)) => Ok(html),
+                Ok(Ok(rendered)) => Ok(rendered),
                 Ok(Err(msg)) => Err(PoolError::Render(msg)),
                 Err(_) => Err(PoolError::WorkerCrashed),
             },

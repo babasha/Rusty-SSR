@@ -89,6 +89,8 @@ pub use engine::SsrEngine;
 pub use error::{SsrError, SsrResult};
 
 /// Configuration types and builder
+pub mod assets;
+
 pub mod config;
 
 /// Main SSR engine
@@ -128,5 +130,7 @@ pub mod prelude {
     };
 
     #[cfg(feature = "v8-pool")]
-    pub use crate::v8_pool::{V8Pool, V8PoolConfig};
+    pub use crate::v8_pool::{Rendered, V8Pool, V8PoolConfig};
+
+    pub use crate::assets::ViteManifest;
 }

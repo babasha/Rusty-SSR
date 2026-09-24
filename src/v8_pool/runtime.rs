@@ -22,6 +22,10 @@ pub struct RuntimeState {
     /// without the outer flag we would re-resolve — and re-fail — on every
     /// single render.
     pub reset_fn: Option<Option<v8::Global<v8::Function>>>,
+    /// Cached `globalThis.__rustySsrTakeModules` handle — how the engine
+    /// collects the modules a render used. Same two levels of `Option` as
+    /// `reset_fn`, for the same reason: `.polyfills(false)` leaves none.
+    pub take_modules_fn: Option<Option<v8::Global<v8::Function>>>,
 }
 
 thread_local! {
@@ -94,6 +98,7 @@ pub fn init_runtime(
                 runtime: js_runtime,
                 render_fn: None,
                 reset_fn: None,
+                take_modules_fn: None,
             });
 
             tracing::debug!(
