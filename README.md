@@ -81,7 +81,7 @@ Rusty SSR runs V8 isolates in a thread pool managed by Rust. Each worker gets it
 
 ```toml
 [dependencies]
-rusty-ssr = "0.3"
+rusty-ssr = "0.6"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 ```
@@ -315,6 +315,21 @@ let html = engine.render_to_html_with_replacements(
 ).await?;
 ```
 
+### What's in 0.4 – 0.6
+
+Full notes in [CHANGELOG.md](CHANGELOG.md).
+
+- **`BuiltPage::uncacheable()`** (0.4) — a build can say "serve this, but do
+  not keep it". For a page that is good enough to send once and not good enough
+  to pin for a whole TTL — say, one rendered after its database query timed out.
+- **`CachedPage::encoded_or_init(f)`** (0.5) — a cached page carries one derived
+  encoding of itself (a compressed body, typically), computed once per entry
+  rather than once per hit, and replaced together with the page on a rebuild.
+- **`render_uncached_collect` + `assets::ViteManifest`** (0.6) — a render
+  reports which code-split modules it used, and the manifest turns that list
+  into `<link rel="modulepreload">` tags, so the browser fetches the chunk a lazy
+  screen needs to hydrate without waiting for the entry to run first.
+
 ### What's in 0.3.0
 
 Full notes in [CHANGELOG.md](CHANGELOG.md).
@@ -497,16 +512,16 @@ globalThis.renderPage = async function(url, data) {
 |---------|---------|-------------|
 | `v8-pool` | ✅ | V8 thread pool |
 | `cache` | ✅ | Multi-tier caching |
-| `axum-integration` | ✅ | Axum middleware |
+| `axum-integration` | ❌ | Axum middleware |
 | `brotli-compression` | ❌ | Brotli middleware |
 | `full` | ❌ | All features |
 
 ```toml
 # Minimal (just V8 pool)
-rusty-ssr = { version = "0.1", default-features = false, features = ["v8-pool"] }
+rusty-ssr = { version = "0.6", default-features = false, features = ["v8-pool"] }
 
 # Full (everything)
-rusty-ssr = { version = "0.1", features = ["full"] }
+rusty-ssr = { version = "0.6", features = ["full"] }
 ```
 
 ## Testing & Benchmarks
@@ -637,4 +652,4 @@ MIT — use it however you want.
 
 ## Contributing
 
-Issues and PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and PRs welcome.
